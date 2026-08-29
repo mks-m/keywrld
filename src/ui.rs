@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -30,6 +30,23 @@ struct OverlayState {
     modifiers: Modifiers,
     hovered: Option<String>,
     metrics: RenderMetrics,
+}
+
+#[derive(Clone, Copy)]
+struct ObservedModifierMasks {
+    event: gdk::ModifierType,
+    device: Option<gdk::ModifierType>,
+}
+
+impl ObservedModifierMasks {
+    fn capture(controller: &gtk::EventControllerKey, event: gdk::ModifierType) -> Self {
+        Self {
+            event,
+            device: controller
+                .current_event_device()
+                .map(|device| device.modifier_state()),
+        }
+    }
 }
 
 pub fn run(layout_override: Option<KeyboardLayout>) -> u8 {
@@ -170,22 +187,22 @@ fn build_window(
     drawing_area.add_controller(click);
 
     let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     keys.connect_key_pressed({
         let state = state.clone();
         let drawing_area = drawing_area.clone();
         let window = window.downgrade();
         move |_, key, _, _| {
+            let before = state.borrow().modifiers;
+            let candidate = modifiers_for_key_event(before, key, true);
             if key == gdk::Key::Escape {
                 if let Some(window) = window.upgrade() {
                     window.close();
                 }
                 return gtk::glib::Propagation::Stop;
             }
-            if let Some(modifier) = modifier_for_key(key) {
-                let mut state = state.borrow_mut();
-                state.modifiers = state.modifiers.with(modifier);
-                state.hovered = None;
-                drawing_area.queue_draw();
+            if let Some(modifiers) = candidate {
+                update_modifiers(&state, &drawing_area, modifiers);
             }
             gtk::glib::Propagation::Proceed
         }
@@ -194,15 +211,24 @@ fn build_window(
         let state = state.clone();
         let drawing_area = drawing_area.clone();
         move |_, key, _, _| {
-            if let Some(modifier) = modifier_for_key(key) {
-                let mut state = state.borrow_mut();
-                state.modifiers = state.modifiers.without(modifier);
-                state.hovered = None;
-                drawing_area.queue_draw();
+            let before = state.borrow().modifiers;
+            let candidate = modifiers_for_key_event(before, key, false);
+            if let Some(modifiers) = candidate {
+                update_modifiers(&state, &drawing_area, modifiers);
             }
         }
     });
-    drawing_area.add_controller(keys);
+    keys.connect_modifiers({
+        let state = state.clone();
+        let drawing_area = drawing_area.clone();
+        move |controller, modifier_state| {
+            let masks = ObservedModifierMasks::capture(controller, modifier_state);
+            let modifiers = modifiers_from_state_change(masks.event, masks.device);
+            update_modifiers(&state, &drawing_area, modifiers);
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(keys);
 
     window.set_child(Some(&drawing_area));
     gtk::prelude::GtkWindowExt::set_focus(&window, Some(&drawing_area));
@@ -232,10 +258,50 @@ fn modifier_for_key(key: gdk::Key) -> Option<Modifiers> {
     match key {
         gdk::Key::Shift_L | gdk::Key::Shift_R => Some(Modifiers::SHIFT),
         gdk::Key::Control_L | gdk::Key::Control_R => Some(Modifiers::CTRL),
-        gdk::Key::Alt_L | gdk::Key::Alt_R | gdk::Key::Meta_L | gdk::Key::Meta_R => {
-            Some(Modifiers::ALT)
-        }
+        gdk::Key::Alt_L | gdk::Key::Alt_R => Some(Modifiers::ALT),
         _ => None,
+    }
+}
+
+fn modifiers_from_gdk(state: gdk::ModifierType) -> Modifiers {
+    let mut modifiers = Modifiers::super_only();
+    if state.contains(gdk::ModifierType::SHIFT_MASK) {
+        modifiers = modifiers.with(Modifiers::SHIFT);
+    }
+    if state.contains(gdk::ModifierType::CONTROL_MASK) {
+        modifiers = modifiers.with(Modifiers::CTRL);
+    }
+    if state.contains(gdk::ModifierType::ALT_MASK) {
+        modifiers = modifiers.with(Modifiers::ALT);
+    }
+    modifiers
+}
+
+fn modifiers_from_state_change(
+    signal_state: gdk::ModifierType,
+    device_state: Option<gdk::ModifierType>,
+) -> Modifiers {
+    modifiers_from_gdk(device_state.unwrap_or(signal_state))
+}
+
+fn modifiers_for_key_event(current: Modifiers, key: gdk::Key, pressed: bool) -> Option<Modifiers> {
+    match (modifier_for_key(key), pressed) {
+        (Some(modifier), true) => Some(current.with(modifier)),
+        (Some(modifier), false) => Some(current.without(modifier)),
+        (None, _) => None,
+    }
+}
+
+fn update_modifiers(
+    state: &Rc<RefCell<OverlayState>>,
+    drawing_area: &gtk::DrawingArea,
+    modifiers: Modifiers,
+) {
+    let mut state = state.borrow_mut();
+    if state.modifiers != modifiers {
+        state.modifiers = modifiers;
+        state.hovered = None;
+        drawing_area.queue_draw();
     }
 }
 
@@ -778,4 +844,80 @@ fn draw_text_right(
         weight,
         color,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_current_gdk_modifier_state_and_keeps_super_implicit() {
+        assert_eq!(
+            modifiers_from_gdk(gdk::ModifierType::empty()),
+            Modifiers::SUPER
+        );
+        assert_eq!(
+            modifiers_from_gdk(
+                gdk::ModifierType::SHIFT_MASK
+                    | gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::ALT_MASK,
+            ),
+            Modifiers::SUPER
+                .with(Modifiers::SHIFT)
+                .with(Modifiers::CTRL)
+                .with(Modifiers::ALT)
+        );
+    }
+
+    #[test]
+    fn state_changes_prefer_post_event_device_mask_over_stale_signal_mask() {
+        assert_eq!(
+            modifiers_from_state_change(
+                gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::ALT_MASK,
+                Some(gdk::ModifierType::ALT_MASK),
+            ),
+            Modifiers::SUPER.with(Modifiers::ALT)
+        );
+        assert_eq!(
+            modifiers_from_state_change(
+                gdk::ModifierType::ALT_MASK,
+                Some(gdk::ModifierType::empty()),
+            ),
+            Modifiers::SUPER
+        );
+        assert_eq!(
+            modifiers_from_state_change(gdk::ModifierType::ALT_MASK, None),
+            Modifiers::SUPER.with(Modifiers::ALT)
+        );
+    }
+
+    #[test]
+    fn modifier_key_events_only_change_their_mapped_modifier() {
+        for (key, modifier) in [
+            (gdk::Key::Shift_L, Modifiers::SHIFT),
+            (gdk::Key::Shift_R, Modifiers::SHIFT),
+            (gdk::Key::Control_L, Modifiers::CTRL),
+            (gdk::Key::Control_R, Modifiers::CTRL),
+            (gdk::Key::Alt_L, Modifiers::ALT),
+            (gdk::Key::Alt_R, Modifiers::ALT),
+        ] {
+            assert_eq!(
+                modifiers_for_key_event(Modifiers::SUPER, key, true),
+                Some(Modifiers::SUPER.with(modifier))
+            );
+            assert_eq!(
+                modifiers_for_key_event(Modifiers::SUPER.with(modifier), key, false),
+                Some(Modifiers::SUPER)
+            );
+        }
+
+        assert_eq!(
+            modifiers_for_key_event(
+                Modifiers::SUPER.with(Modifiers::ALT),
+                gdk::Key::VoidSymbol,
+                false,
+            ),
+            None
+        );
+    }
 }
