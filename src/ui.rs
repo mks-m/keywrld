@@ -1,4 +1,4 @@
-use std::cell::{RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -8,7 +8,10 @@ use gtk::prelude::*;
 use gtk4 as gtk;
 use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell};
 
-use crate::core::{Color, KeyboardGeometry, KeyboardLayout, Modifiers, Palette, Rect, actions_for};
+use crate::core::{
+    Binding, Color, KeyboardGeometry, KeyboardLayout, Modifiers, Palette, Rect, actions_for,
+    chord_label, is_mouse_key,
+};
 use crate::system::{RuntimeSnapshot, load_runtime};
 
 #[derive(Clone, Debug)]
@@ -27,6 +30,8 @@ struct RenderMetrics {
 struct OverlayState {
     snapshot: RuntimeSnapshot,
     geometry: KeyboardGeometry,
+    latched_modifiers: Modifiers,
+    held_modifiers: Modifiers,
     modifiers: Modifiers,
     hovered: Option<String>,
     metrics: RenderMetrics,
@@ -119,7 +124,9 @@ fn build_window(
     let state = Rc::new(RefCell::new(OverlayState {
         geometry: KeyboardGeometry::new(snapshot.layout),
         snapshot,
-        modifiers: Modifiers::super_only(),
+        latched_modifiers: Modifiers::default(),
+        held_modifiers: Modifiers::default(),
+        modifiers: Modifiers::default(),
         hovered: None,
         metrics: RenderMetrics::default(),
     }));
@@ -175,9 +182,19 @@ fn build_window(
     let click = gtk::GestureClick::new();
     click.connect_released({
         let state = state.clone();
+        let drawing_area = drawing_area.clone();
         let window = window.downgrade();
         move |_, _, x, y| {
-            if !state.borrow().metrics.panel.contains(x, y)
+            let clicked_modifier = state
+                .borrow()
+                .metrics
+                .hits
+                .iter()
+                .find(|hit| hit.rect.contains(x, y))
+                .and_then(|hit| modifier_for_key_id(&hit.key));
+            if let Some(modifier) = clicked_modifier {
+                toggle_latched_modifier(&state, &drawing_area, modifier);
+            } else if !state.borrow().metrics.panel.contains(x, y)
                 && let Some(window) = window.upgrade()
             {
                 window.close();
@@ -193,7 +210,7 @@ fn build_window(
         let drawing_area = drawing_area.clone();
         let window = window.downgrade();
         move |_, key, _, _| {
-            let before = state.borrow().modifiers;
+            let before = state.borrow().held_modifiers;
             let candidate = modifiers_for_key_event(before, key, true);
             if key == gdk::Key::Escape {
                 if let Some(window) = window.upgrade() {
@@ -202,7 +219,7 @@ fn build_window(
                 return gtk::glib::Propagation::Stop;
             }
             if let Some(modifiers) = candidate {
-                update_modifiers(&state, &drawing_area, modifiers);
+                update_held_modifiers(&state, &drawing_area, modifiers);
             }
             gtk::glib::Propagation::Proceed
         }
@@ -211,10 +228,10 @@ fn build_window(
         let state = state.clone();
         let drawing_area = drawing_area.clone();
         move |_, key, _, _| {
-            let before = state.borrow().modifiers;
+            let before = state.borrow().held_modifiers;
             let candidate = modifiers_for_key_event(before, key, false);
             if let Some(modifiers) = candidate {
-                update_modifiers(&state, &drawing_area, modifiers);
+                update_held_modifiers(&state, &drawing_area, modifiers);
             }
         }
     });
@@ -223,8 +240,9 @@ fn build_window(
         let drawing_area = drawing_area.clone();
         move |controller, modifier_state| {
             let masks = ObservedModifierMasks::capture(controller, modifier_state);
-            let modifiers = modifiers_from_state_change(masks.event, masks.device);
-            update_modifiers(&state, &drawing_area, modifiers);
+            let current = state.borrow().held_modifiers;
+            let modifiers = modifiers_from_state_change(masks.event, masks.device, current);
+            update_held_modifiers(&state, &drawing_area, modifiers);
             gtk::glib::Propagation::Proceed
         }
     });
@@ -259,12 +277,13 @@ fn modifier_for_key(key: gdk::Key) -> Option<Modifiers> {
         gdk::Key::Shift_L | gdk::Key::Shift_R => Some(Modifiers::SHIFT),
         gdk::Key::Control_L | gdk::Key::Control_R => Some(Modifiers::CTRL),
         gdk::Key::Alt_L | gdk::Key::Alt_R => Some(Modifiers::ALT),
+        gdk::Key::Super_L | gdk::Key::Super_R => Some(Modifiers::SUPER),
         _ => None,
     }
 }
 
 fn modifiers_from_gdk(state: gdk::ModifierType) -> Modifiers {
-    let mut modifiers = Modifiers::super_only();
+    let mut modifiers = Modifiers::default();
     if state.contains(gdk::ModifierType::SHIFT_MASK) {
         modifiers = modifiers.with(Modifiers::SHIFT);
     }
@@ -280,8 +299,15 @@ fn modifiers_from_gdk(state: gdk::ModifierType) -> Modifiers {
 fn modifiers_from_state_change(
     signal_state: gdk::ModifierType,
     device_state: Option<gdk::ModifierType>,
+    current: Modifiers,
 ) -> Modifiers {
-    modifiers_from_gdk(device_state.unwrap_or(signal_state))
+    let observed = device_state.unwrap_or(signal_state);
+    let modifiers = modifiers_from_gdk(observed);
+    if current.contains(Modifiers::SUPER) && observed.contains(gdk::ModifierType::SUPER_MASK) {
+        modifiers.with(Modifiers::SUPER)
+    } else {
+        modifiers
+    }
 }
 
 fn modifiers_for_key_event(current: Modifiers, key: gdk::Key, pressed: bool) -> Option<Modifiers> {
@@ -292,17 +318,31 @@ fn modifiers_for_key_event(current: Modifiers, key: gdk::Key, pressed: bool) -> 
     }
 }
 
-fn update_modifiers(
+fn update_held_modifiers(
     state: &Rc<RefCell<OverlayState>>,
     drawing_area: &gtk::DrawingArea,
-    modifiers: Modifiers,
+    held_modifiers: Modifiers,
 ) {
     let mut state = state.borrow_mut();
-    if state.modifiers != modifiers {
+    let modifiers = state.latched_modifiers.with(held_modifiers);
+    if state.modifiers != modifiers || state.held_modifiers != held_modifiers {
+        state.held_modifiers = held_modifiers;
         state.modifiers = modifiers;
         state.hovered = None;
         drawing_area.queue_draw();
     }
+}
+
+fn toggle_latched_modifier(
+    state: &Rc<RefCell<OverlayState>>,
+    drawing_area: &gtk::DrawingArea,
+    modifier: Modifiers,
+) {
+    let mut state = state.borrow_mut();
+    state.latched_modifiers = state.latched_modifiers.toggled(modifier);
+    state.modifiers = state.latched_modifiers.with(state.held_modifiers);
+    state.hovered = None;
+    drawing_area.queue_draw();
 }
 
 fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayState) {
@@ -314,8 +354,21 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
     let geometry_ids = state.geometry.key_ids();
     let overflow: Vec<_> = actions
         .iter()
-        .filter(|(key, _)| !geometry_ids.contains(key.as_str()))
+        .filter(|(key, _)| !geometry_ids.contains(key.as_str()) && !is_mouse_key(key))
         .collect();
+    let mut mouse_bindings: Vec<_> = state
+        .snapshot
+        .bindings
+        .iter()
+        .filter(|binding| is_mouse_key(&binding.key))
+        .cloned()
+        .collect();
+    mouse_bindings.sort_by(|left, right| {
+        left.modifiers
+            .cmp(&right.modifiers)
+            .then_with(|| left.key.cmp(&right.key))
+            .then_with(|| left.action.cmp(&right.action))
+    });
 
     let outer_padding = 24.0;
     let header_height = 82.0;
@@ -329,8 +382,15 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
     } else {
         chip_rows as f64 * chip_height + 12.0
     };
+    let side_gap = if mouse_bindings.is_empty() { 0.0 } else { 18.0 };
+    let mouse_panel_width = if mouse_bindings.is_empty() {
+        0.0
+    } else {
+        (width * 0.18).clamp(240.0, 310.0)
+    };
 
-    let available_width = (width * 0.92 - outer_padding * 2.0).max(320.0);
+    let available_width =
+        (width * 0.94 - mouse_panel_width - side_gap - outer_padding * 2.0).max(320.0);
     let available_height =
         (height * 0.9 - header_height - detail_height - overflow_height - outer_padding * 2.0)
             .max(180.0);
@@ -342,13 +402,41 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
     let panel_width = board_width + outer_padding * 2.0;
     let panel_height =
         header_height + board_height + overflow_height + detail_height + outer_padding * 2.0;
+    let total_width = panel_width + side_gap + mouse_panel_width;
     let panel = Rect {
-        x: (width - panel_width) / 2.0,
+        x: (width - total_width) / 2.0,
         y: (height - panel_height) / 2.0,
         width: panel_width,
         height: panel_height,
     };
-    state.metrics.panel = panel;
+    let mouse_row_height = if mouse_bindings.is_empty() {
+        0.0
+    } else {
+        ((height * 0.82 - 72.0) / mouse_bindings.len() as f64).clamp(40.0, 52.0)
+    };
+    let mouse_panel_height = if mouse_bindings.is_empty() {
+        0.0
+    } else {
+        72.0 + mouse_row_height * mouse_bindings.len() as f64
+    };
+    let mouse_panel = Rect {
+        x: panel.x + panel.width + side_gap,
+        y: (height - mouse_panel_height) / 2.0,
+        width: mouse_panel_width,
+        height: mouse_panel_height,
+    };
+    state.metrics.panel = if mouse_bindings.is_empty() {
+        panel
+    } else {
+        let top = panel.y.min(mouse_panel.y);
+        let bottom = (panel.y + panel.height).max(mouse_panel.y + mouse_panel.height);
+        Rect {
+            x: panel.x,
+            y: top,
+            width: total_width,
+            height: bottom - top,
+        }
+    };
     state.metrics.hits.clear();
 
     rounded_rectangle(context, panel, 18.0);
@@ -432,6 +520,85 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
         },
         palette,
     );
+
+    if !mouse_bindings.is_empty() {
+        draw_mouse_panel(
+            context,
+            mouse_panel,
+            mouse_row_height,
+            &mouse_bindings,
+            palette,
+        );
+    }
+}
+
+fn draw_mouse_panel(
+    context: &Context,
+    panel: Rect,
+    row_height: f64,
+    bindings: &[Binding],
+    palette: Palette,
+) {
+    rounded_rectangle(context, panel, 16.0);
+    set_source(context, palette.background.with_alpha(0.985));
+    let _ = context.fill_preserve();
+    context.set_line_width(1.0);
+    set_source(context, palette.muted.with_alpha(0.9));
+    let _ = context.stroke();
+
+    draw_text(
+        context,
+        panel.x + 18.0,
+        panel.y + 29.0,
+        "MOUSE",
+        15.0,
+        FontWeight::Bold,
+        palette.foreground,
+    );
+    draw_text(
+        context,
+        panel.x + 18.0,
+        panel.y + 49.0,
+        &format!("{} global bindings", bindings.len()),
+        11.0,
+        FontWeight::Normal,
+        palette.dark_foreground,
+    );
+
+    for (index, binding) in bindings.iter().enumerate() {
+        let rect = Rect {
+            x: panel.x + 12.0,
+            y: panel.y + 62.0 + index as f64 * row_height,
+            width: panel.width - 24.0,
+            height: row_height - 6.0,
+        };
+        rounded_rectangle(context, rect, 7.0);
+        set_source(context, palette.darker_background.with_alpha(0.58));
+        let _ = context.fill();
+
+        let key = friendly_key_name(&binding.key);
+        draw_text(
+            context,
+            rect.x + 10.0,
+            rect.y + 15.0,
+            &elide(
+                &chord_label(binding.modifiers, &key),
+                ((rect.width - 20.0) / 6.0) as usize,
+            ),
+            10.0,
+            FontWeight::Bold,
+            palette.accent,
+        );
+        draw_text(
+            context,
+            rect.x + 10.0,
+            rect.y + 32.0,
+            &elide(&binding.action, ((rect.width - 20.0) / 5.8) as usize),
+            10.5,
+            FontWeight::Normal,
+            palette.foreground,
+        );
+    }
 }
 
 fn draw_header(
@@ -446,7 +613,11 @@ fn draw_header(
         context,
         x,
         y + 24.0,
-        &state.modifiers.label(),
+        &if state.modifiers.is_empty() {
+            "NO MODIFIERS".to_string()
+        } else {
+            state.modifiers.label()
+        },
         22.0,
         FontWeight::Bold,
         palette.foreground,
@@ -461,11 +632,10 @@ fn draw_header(
         palette.dark_foreground,
     );
 
-    let message = state
-        .snapshot
-        .binding_error
-        .as_deref()
-        .unwrap_or("Hold Shift, Ctrl, or Alt to inspect an exact chord · Hover for details");
+    let message =
+        state.snapshot.binding_error.as_deref().unwrap_or(
+            "Hold any modifier, or click Shift, Ctrl, and Alt to keep them selected · Hover for details",
+        );
     draw_text(
         context,
         x,
@@ -619,7 +789,7 @@ fn draw_details(
 
     match hovered {
         Some((hit, Some(key_actions))) => {
-            let chord = format!("{} + {}", state.modifiers.label(), hit.legend);
+            let chord = chord_label(state.modifiers, &hit.legend);
             draw_text(
                 context,
                 rect.x + 14.0,
@@ -648,9 +818,8 @@ fn draw_details(
                 rect.x + 14.0,
                 rect.y + 33.0,
                 &format!(
-                    "{} + {}  ·  No binding",
-                    state.modifiers.label(),
-                    hit.legend
+                    "{}  ·  No binding",
+                    chord_label(state.modifiers, &hit.legend)
                 ),
                 13.0,
                 FontWeight::Normal,
@@ -685,8 +854,17 @@ fn modifier_key_active(key: &str, modifiers: Modifiers) -> bool {
         "SHIFTLEFT" | "SHIFTRIGHT" => modifiers.contains(Modifiers::SHIFT),
         "CTRLLEFT" | "CTRLRIGHT" => modifiers.contains(Modifiers::CTRL),
         "ALTLEFT" | "ALTRIGHT" => modifiers.contains(Modifiers::ALT),
-        "SUPERLEFT" | "SUPERRIGHT" => true,
+        "SUPERLEFT" | "SUPERRIGHT" => modifiers.contains(Modifiers::SUPER),
         _ => false,
+    }
+}
+
+fn modifier_for_key_id(key: &str) -> Option<Modifiers> {
+    match key {
+        "SHIFTLEFT" | "SHIFTRIGHT" => Some(Modifiers::SHIFT),
+        "CTRLLEFT" | "CTRLRIGHT" => Some(Modifiers::CTRL),
+        "ALTLEFT" | "ALTRIGHT" => Some(Modifiers::ALT),
+        _ => None,
     }
 }
 
@@ -694,8 +872,9 @@ fn friendly_key_name(key: &str) -> String {
     match key {
         "MOUSE_DOWN" => "Mouse wheel down".into(),
         "MOUSE_UP" => "Mouse wheel up".into(),
-        "LEFT MOUSE BUTTON" => "Left mouse button".into(),
-        "RIGHT MOUSE BUTTON" => "Right mouse button".into(),
+        "MOUSE_LEFT" => "Left mouse button".into(),
+        "MOUSE_RIGHT" => "Right mouse button".into(),
+        "MOUSE_MIDDLE" => "Middle mouse button".into(),
         value if value.starts_with("XF86") => value.trim_start_matches("XF86").into(),
         value => value.replace('_', " ").to_ascii_lowercase(),
     }
@@ -849,12 +1028,13 @@ fn draw_text_right(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gtk::cairo::{Format, ImageSurface};
 
     #[test]
-    fn maps_current_gdk_modifier_state_and_keeps_super_implicit() {
+    fn maps_only_the_current_physical_gdk_modifier_state() {
         assert_eq!(
             modifiers_from_gdk(gdk::ModifierType::empty()),
-            Modifiers::SUPER
+            Modifiers::default()
         );
         assert_eq!(
             modifiers_from_gdk(
@@ -862,10 +1042,11 @@ mod tests {
                     | gdk::ModifierType::CONTROL_MASK
                     | gdk::ModifierType::ALT_MASK,
             ),
-            Modifiers::SUPER
-                .with(Modifiers::SHIFT)
-                .with(Modifiers::CTRL)
-                .with(Modifiers::ALT)
+            Modifiers::SHIFT.with(Modifiers::CTRL).with(Modifiers::ALT)
+        );
+        assert_eq!(
+            modifiers_from_gdk(gdk::ModifierType::SUPER_MASK),
+            Modifiers::default()
         );
     }
 
@@ -875,19 +1056,49 @@ mod tests {
             modifiers_from_state_change(
                 gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::ALT_MASK,
                 Some(gdk::ModifierType::ALT_MASK),
+                Modifiers::default(),
             ),
-            Modifiers::SUPER.with(Modifiers::ALT)
+            Modifiers::ALT
         );
         assert_eq!(
             modifiers_from_state_change(
                 gdk::ModifierType::ALT_MASK,
                 Some(gdk::ModifierType::empty()),
+                Modifiers::default(),
+            ),
+            Modifiers::default()
+        );
+        assert_eq!(
+            modifiers_from_state_change(gdk::ModifierType::ALT_MASK, None, Modifiers::default()),
+            Modifiers::ALT
+        );
+    }
+
+    #[test]
+    fn startup_super_state_is_ignored_until_a_fresh_key_press() {
+        assert_eq!(
+            modifiers_from_state_change(
+                gdk::ModifierType::SUPER_MASK,
+                Some(gdk::ModifierType::SUPER_MASK),
+                Modifiers::default(),
+            ),
+            Modifiers::default()
+        );
+        assert_eq!(
+            modifiers_from_state_change(
+                gdk::ModifierType::SUPER_MASK,
+                Some(gdk::ModifierType::SUPER_MASK),
+                Modifiers::SUPER,
             ),
             Modifiers::SUPER
         );
         assert_eq!(
-            modifiers_from_state_change(gdk::ModifierType::ALT_MASK, None),
-            Modifiers::SUPER.with(Modifiers::ALT)
+            modifiers_from_state_change(
+                gdk::ModifierType::SUPER_MASK,
+                Some(gdk::ModifierType::empty()),
+                Modifiers::SUPER,
+            ),
+            Modifiers::default()
         );
     }
 
@@ -900,14 +1111,16 @@ mod tests {
             (gdk::Key::Control_R, Modifiers::CTRL),
             (gdk::Key::Alt_L, Modifiers::ALT),
             (gdk::Key::Alt_R, Modifiers::ALT),
+            (gdk::Key::Super_L, Modifiers::SUPER),
+            (gdk::Key::Super_R, Modifiers::SUPER),
         ] {
             assert_eq!(
-                modifiers_for_key_event(Modifiers::SUPER, key, true),
-                Some(Modifiers::SUPER.with(modifier))
+                modifiers_for_key_event(Modifiers::default(), key, true),
+                Some(modifier)
             );
             assert_eq!(
-                modifiers_for_key_event(Modifiers::SUPER.with(modifier), key, false),
-                Some(Modifiers::SUPER)
+                modifiers_for_key_event(modifier, key, false),
+                Some(Modifiers::default())
             );
         }
 
@@ -919,5 +1132,68 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn super_can_be_held_but_not_click_latched() {
+        assert_eq!(modifier_for_key_id("SUPERLEFT"), None);
+        assert_eq!(modifier_for_key_id("SUPERRIGHT"), None);
+        assert_eq!(modifier_for_key_id("SHIFTLEFT"), Some(Modifiers::SHIFT));
+        assert!(!modifier_key_active("SUPERLEFT", Modifiers::default()));
+        assert!(modifier_key_active("SUPERLEFT", Modifiers::SUPER));
+    }
+
+    #[test]
+    fn mouse_card_does_not_change_with_the_selected_keyboard_chord() {
+        let surface = ImageSurface::create(Format::ARgb32, 1920, 1080).unwrap();
+        let context = Context::new(&surface).unwrap();
+        let bindings = [
+            (Modifiers::SUPER, "MOUSE_DOWN", "Next workspace"),
+            (Modifiers::SUPER, "MOUSE_UP", "Previous workspace"),
+            (Modifiers::SUPER, "MOUSE_LEFT", "Move window"),
+            (Modifiers::SUPER, "MOUSE_RIGHT", "Resize window"),
+            (
+                Modifiers::SUPER.with(Modifiers::ALT),
+                "MOUSE_DOWN",
+                "Next group window",
+            ),
+            (
+                Modifiers::SUPER.with(Modifiers::ALT),
+                "MOUSE_UP",
+                "Previous group window",
+            ),
+        ]
+        .into_iter()
+        .map(|(modifiers, key, action)| Binding {
+            modifiers,
+            key: key.into(),
+            action: action.into(),
+        })
+        .collect();
+        let mut state = OverlayState {
+            snapshot: RuntimeSnapshot {
+                bindings,
+                binding_error: None,
+                layout: KeyboardLayout::Tkl,
+                device_name: "Test keyboard · TKL".into(),
+                monitor_connector: None,
+                palette: Palette::default(),
+            },
+            geometry: KeyboardGeometry::new(KeyboardLayout::Tkl),
+            latched_modifiers: Modifiers::default(),
+            held_modifiers: Modifiers::SUPER,
+            modifiers: Modifiers::SUPER,
+            hovered: None,
+            metrics: RenderMetrics::default(),
+        };
+
+        draw_overlay(&context, 1920.0, 1080.0, &mut state);
+        let super_panel = state.metrics.panel;
+        assert!(state.metrics.hits.iter().all(|hit| !is_mouse_key(&hit.key)));
+
+        state.held_modifiers = Modifiers::SUPER.with(Modifiers::ALT);
+        state.modifiers = state.held_modifiers;
+        draw_overlay(&context, 1920.0, 1080.0, &mut state);
+        assert_eq!(state.metrics.panel, super_panel);
     }
 }

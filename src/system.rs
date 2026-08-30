@@ -6,7 +6,8 @@ use std::process::Command;
 use serde_json::Value;
 
 use crate::core::{
-    Binding, DeviceCandidate, KeyboardLayout, Palette, detect_keyboard_layout, parse_bindings,
+    Binding, DeviceCandidate, KeyboardLayout, Modifiers, Palette, detect_keyboard_layout,
+    normalize_key, parse_bindings,
 };
 
 #[derive(Clone, Debug)]
@@ -39,6 +40,34 @@ pub fn load_runtime(layout_override: Option<KeyboardLayout>) -> RuntimeSnapshot 
 }
 
 fn load_bindings() -> Result<Vec<Binding>, String> {
+    let hyprland = Command::new("hyprctl")
+        .arg("binds")
+        .output()
+        .map_err(|error| format!("Could not query Hyprland's binding registry: {error}"))?;
+
+    if !hyprland.status.success() {
+        let stderr = String::from_utf8_lossy(&hyprland.stderr);
+        return Err(format!(
+            "Hyprland could not read the system binding registry{}",
+            stderr
+                .lines()
+                .next()
+                .map(|line| format!(": {line}"))
+                .unwrap_or_default()
+        ));
+    }
+
+    let supplements = load_omarchy_bindings().unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&hyprland.stdout);
+    let bindings = parse_hyprland_bindings(&stdout, &supplements);
+    if bindings.is_empty() {
+        return Err("Hyprland returned no displayable system bindings".into());
+    }
+
+    Ok(bindings)
+}
+
+fn load_omarchy_bindings() -> Result<Vec<Binding>, String> {
     let output = Command::new("omarchy")
         .args(["menu", "keybindings", "--print"])
         .output()
@@ -58,14 +87,111 @@ fn load_bindings() -> Result<Vec<Binding>, String> {
         ));
     }
 
-    if !bindings
-        .iter()
-        .any(|binding| binding.modifiers.contains(crate::core::Modifiers::SUPER))
-    {
-        return Err("Omarchy returned no SUPER bindings".into());
+    Ok(bindings)
+}
+
+#[derive(Default)]
+struct HyprlandBindingRecord {
+    modmask: u16,
+    key: String,
+    keycode: u16,
+    description: String,
+    dispatcher: String,
+    arg: String,
+}
+
+fn parse_hyprland_bindings(output: &str, supplements: &[Binding]) -> Vec<Binding> {
+    let mut bindings = Vec::new();
+    let mut record = None::<HyprlandBindingRecord>;
+
+    for line in output.lines() {
+        if line.starts_with("bind") {
+            if let Some(record) = record.take() {
+                add_hyprland_binding(&mut bindings, record, supplements);
+            }
+            record = Some(HyprlandBindingRecord::default());
+            continue;
+        }
+
+        let Some(record) = record.as_mut() else {
+            continue;
+        };
+        let Some((field, value)) = line.trim_start().split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match field {
+            "modmask" => record.modmask = value.parse().unwrap_or_default(),
+            "key" => record.key = value.to_string(),
+            "keycode" => record.keycode = value.parse().unwrap_or_default(),
+            "description" => record.description = value.to_string(),
+            "dispatcher" => record.dispatcher = value.to_string(),
+            "arg" => record.arg = value.to_string(),
+            _ => {}
+        }
     }
 
-    Ok(bindings)
+    if let Some(record) = record {
+        add_hyprland_binding(&mut bindings, record, supplements);
+    }
+    bindings
+}
+
+fn add_hyprland_binding(
+    bindings: &mut Vec<Binding>,
+    record: HyprlandBindingRecord,
+    supplements: &[Binding],
+) {
+    let modifiers = Modifiers::from_hyprland_mask(record.modmask);
+    let mut key = record
+        .key
+        .rsplit_once(" + ")
+        .map_or(record.key.as_str(), |(_, key)| key)
+        .trim()
+        .to_string();
+
+    if key.is_empty() && record.keycode != 0 {
+        key = format!("code:{}", record.keycode);
+    }
+    if key.is_empty() && !record.description.is_empty() {
+        key = supplements
+            .iter()
+            .find(|binding| binding.modifiers == modifiers && binding.action == record.description)
+            .map(|binding| binding.key.clone())
+            .unwrap_or_default();
+    }
+    if key.is_empty() || key.to_ascii_lowercase().starts_with("switch:") {
+        return;
+    }
+
+    let action = if record.description.is_empty() {
+        match (record.dispatcher.as_str(), record.arg.as_str()) {
+            ("", "") => "System binding".to_string(),
+            (dispatcher, "") => dispatcher.to_string(),
+            ("exec", arg) => arg.to_string(),
+            (dispatcher, arg) => format!("{dispatcher}: {arg}"),
+        }
+    } else {
+        record.description
+    };
+    let binding = Binding {
+        modifiers,
+        key: normalize_key(&key),
+        action,
+    };
+
+    if !is_obvious_labeled_binding(&binding) && !bindings.contains(&binding) {
+        bindings.push(binding);
+    }
+}
+
+fn is_obvious_labeled_binding(binding: &Binding) -> bool {
+    binding.modifiers.is_empty()
+        && (binding.key.starts_with("XF86")
+            || matches!(
+                binding.key.as_str(),
+                "PRINT" | "SCROLLLOCK" | "PAUSE" | "NUMLOCK" | "CAPSLOCK"
+            ))
 }
 
 fn load_palette() -> Palette {
@@ -268,6 +394,66 @@ mod tests {
         assert_eq!(
             normalize_device_name("CORSAIR CORSAIR K63 Wireless Mechanical Gaming Keyboard"),
             "corsair-corsair-k63-wireless-mechanical-gaming-keyboard"
+        );
+    }
+
+    #[test]
+    fn parses_live_hyprland_records_and_recovers_lua_code_keys() {
+        let supplements = parse_bindings(
+            "SUPER + 1 → Switch to workspace 1\n\
+             SHIFT ALT + D → App-only shortcut\n",
+        );
+        let output = "\
+bindd
+\tmodmask: 0
+\tkey: XF86AudioRaiseVolume
+\tkeycode: 0
+\tdescription: Volume up
+\tdispatcher: exec
+\targ: volume-up
+
+bindd
+\tmodmask: 64
+\tkey:
+\tkeycode: 0
+\tdescription: Switch to workspace 1
+\tdispatcher: __lua
+\targ: 71
+
+bindd
+\tmodmask: 72
+\tkey: mouse:272
+\tkeycode: 0
+\tdescription: Move window precisely
+\tdispatcher: __lua
+\targ: 73
+
+bind
+\tmodmask: 12
+\tkey: DELETE
+\tkeycode: 0
+\tdescription:
+\tdispatcher: exec
+\targ: close-everything
+";
+
+        let bindings = parse_hyprland_bindings(output, &supplements);
+        assert_eq!(bindings.len(), 3);
+        assert_eq!(
+            bindings[0],
+            Binding {
+                modifiers: Modifiers::SUPER,
+                key: "1".into(),
+                action: "Switch to workspace 1".into(),
+            }
+        );
+        assert_eq!(bindings[1].key, "MOUSE_LEFT");
+        assert_eq!(bindings[1].modifiers, Modifiers::SUPER.with(Modifiers::ALT));
+        assert_eq!(bindings[2].action, "close-everything");
+        assert!(
+            bindings
+                .iter()
+                .all(|binding| binding.action != "App-only shortcut")
         );
     }
 }

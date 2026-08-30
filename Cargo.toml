@@ -3,7 +3,7 @@ name = "keywrld"
 version = "0.1.6"
 edition = "2024"
 rust-version = "1.92"
-description = "A keyboard-shaped Omarchy shortcut overlay"
+description = "A keyboard-shaped Hyprland system shortcut overlay"
 
 [dependencies]
 gtk4 = "0.11.3"

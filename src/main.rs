@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use crate::core::KeyboardLayout;
 
 const HELP: &str = "\
-keywrld — keyboard-shaped Omarchy shortcut help
+keywrld — keyboard-shaped system shortcut help
 
 Usage:
   keywrld [--layout auto|full|100|tkl|80|75|65|60]

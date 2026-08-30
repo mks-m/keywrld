@@ -8,13 +8,17 @@ impl Modifiers {
     pub const CTRL: Self = Self(1 << 1);
     pub const ALT: Self = Self(1 << 2);
     pub const SUPER: Self = Self(1 << 3);
-
-    pub const fn super_only() -> Self {
-        Self::SUPER
-    }
+    pub const CAPS_LOCK: Self = Self(1 << 4);
+    pub const MOD2: Self = Self(1 << 5);
+    pub const MOD3: Self = Self(1 << 6);
+    pub const MOD5: Self = Self(1 << 7);
 
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
     }
 
     pub fn with(self, other: Self) -> Self {
@@ -23,6 +27,29 @@ impl Modifiers {
 
     pub fn without(self, other: Self) -> Self {
         Self(self.0 & !other.0)
+    }
+
+    pub fn toggled(self, other: Self) -> Self {
+        Self(self.0 ^ other.0)
+    }
+
+    pub fn from_hyprland_mask(mask: u16) -> Self {
+        let mut modifiers = Self::default();
+        for (hyprland_bit, modifier) in [
+            (1, Self::SHIFT),
+            (2, Self::CAPS_LOCK),
+            (4, Self::CTRL),
+            (8, Self::ALT),
+            (16, Self::MOD2),
+            (32, Self::MOD3),
+            (64, Self::SUPER),
+            (128, Self::MOD5),
+        ] {
+            if mask & hyprland_bit != 0 {
+                modifiers = modifiers.with(modifier);
+            }
+        }
+        modifiers
     }
 
     pub fn label(self) -> String {
@@ -39,6 +66,18 @@ impl Modifiers {
         if self.contains(Self::ALT) {
             parts.push("ALT");
         }
+        if self.contains(Self::CAPS_LOCK) {
+            parts.push("CAPS");
+        }
+        if self.contains(Self::MOD2) {
+            parts.push("MOD2");
+        }
+        if self.contains(Self::MOD3) {
+            parts.push("MOD3");
+        }
+        if self.contains(Self::MOD5) {
+            parts.push("MOD5");
+        }
         parts.join(" + ")
     }
 
@@ -51,6 +90,10 @@ impl Modifiers {
                     "SHIFT" => mods.with(Self::SHIFT),
                     "CTRL" | "CONTROL" => mods.with(Self::CTRL),
                     "ALT" | "MOD1" => mods.with(Self::ALT),
+                    "CAPS" | "CAPSLOCK" | "CAPS_LOCK" => mods.with(Self::CAPS_LOCK),
+                    "MOD2" => mods.with(Self::MOD2),
+                    "MOD3" => mods.with(Self::MOD3),
+                    "MOD5" => mods.with(Self::MOD5),
                     _ => mods,
                 }
             })
@@ -90,7 +133,7 @@ fn parse_binding_line(line: &str) -> Option<Binding> {
 pub fn actions_for(bindings: &[Binding], modifiers: Modifiers) -> BTreeMap<String, Vec<String>> {
     let mut grouped = BTreeMap::<String, Vec<String>>::new();
     for binding in bindings {
-        if binding.modifiers == modifiers && binding.modifiers.contains(Modifiers::SUPER) {
+        if binding.modifiers == modifiers {
             let actions = grouped.entry(binding.key.clone()).or_default();
             if !actions.contains(&binding.action) {
                 actions.push(binding.action.clone());
@@ -123,7 +166,40 @@ pub fn normalize_key(key: &str) -> String {
         "GRAVE" | "GRAVE ACCENT" => "GRAVE".into(),
         "MOUSE DOWN" => "MOUSE_DOWN".into(),
         "MOUSE UP" => "MOUSE_UP".into(),
+        "MOUSE:272" | "LEFT MOUSE BUTTON" => "MOUSE_LEFT".into(),
+        "MOUSE:273" | "RIGHT MOUSE BUTTON" => "MOUSE_RIGHT".into(),
+        "MOUSE:274" | "MIDDLE MOUSE BUTTON" => "MOUSE_MIDDLE".into(),
+        "CODE:10" => "1".into(),
+        "CODE:11" => "2".into(),
+        "CODE:12" => "3".into(),
+        "CODE:13" => "4".into(),
+        "CODE:14" => "5".into(),
+        "CODE:15" => "6".into(),
+        "CODE:16" => "7".into(),
+        "CODE:17" => "8".into(),
+        "CODE:18" => "9".into(),
+        "CODE:19" => "0".into(),
+        "CODE:20" => "MINUS".into(),
+        "CODE:21" => "EQUAL".into(),
+        "CODE:59" => "COMMA".into(),
+        "CODE:60" => "PERIOD".into(),
+        "CODE:61" => "SLASH".into(),
         value => value.to_string(),
+    }
+}
+
+pub fn is_mouse_key(key: &str) -> bool {
+    matches!(
+        key,
+        "MOUSE_DOWN" | "MOUSE_UP" | "MOUSE_LEFT" | "MOUSE_RIGHT" | "MOUSE_MIDDLE"
+    ) || key.starts_with("MOUSE:")
+}
+
+pub fn chord_label(modifiers: Modifiers, key: &str) -> String {
+    if modifiers.is_empty() {
+        key.to_string()
+    } else {
+        format!("{} + {key}", modifiers.label())
     }
 }
 
@@ -628,9 +704,24 @@ mod tests {
              ALT + K → Not shown\n",
         );
 
-        let actions = actions_for(&bindings, Modifiers::super_only());
+        let actions = actions_for(&bindings, Modifiers::SUPER);
         assert_eq!(actions.get("K"), Some(&vec!["Keybindings".to_string()]));
         assert_eq!(actions.len(), 1);
+
+        let alt_actions = actions_for(&bindings, Modifiers::ALT);
+        assert_eq!(alt_actions.get("K"), Some(&vec!["Not shown".to_string()]));
+    }
+
+    #[test]
+    fn maps_hyprland_masks_and_normalizes_pointing_device_keys() {
+        assert_eq!(
+            Modifiers::from_hyprland_mask(64 | 1 | 8),
+            Modifiers::SUPER.with(Modifiers::SHIFT).with(Modifiers::ALT)
+        );
+        assert_eq!(normalize_key("mouse:272"), "MOUSE_LEFT");
+        assert_eq!(normalize_key("code:10"), "1");
+        assert!(is_mouse_key("MOUSE_UP"));
+        assert!(!is_mouse_key("UP"));
     }
 
     #[test]
