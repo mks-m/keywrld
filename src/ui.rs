@@ -12,6 +12,7 @@ use crate::core::{
     Binding, Color, KeyboardGeometry, KeyboardLayout, Modifiers, Palette, Rect, actions_for,
     chord_label, is_mouse_key,
 };
+use crate::icons::{ActionIcon, IconAtlas, icons_for_actions, with_icon_atlas};
 use crate::system::{RuntimeSnapshot, load_runtime};
 
 #[derive(Clone, Debug)]
@@ -468,15 +469,18 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
         let key_actions = actions.get(&key.id);
         let hovered = state.hovered.as_deref() == Some(key.id.as_str());
         let modifier_active = modifier_key_active(&key.id, state.modifiers);
-        draw_key(
-            context,
-            rect,
-            &key.legend,
-            key_actions,
-            hovered,
-            modifier_active,
-            palette,
-        );
+        with_icon_atlas(|icon_atlas| {
+            draw_key(
+                context,
+                rect,
+                &key.legend,
+                key_actions,
+                hovered,
+                modifier_active,
+                icon_atlas,
+                palette,
+            );
+        });
         state.metrics.hits.push(HitRegion {
             rect,
             key: key.id.clone(),
@@ -498,7 +502,17 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
                 height: chip_height - chip_gap,
             };
             let hovered = state.hovered.as_deref() == Some(key.as_str());
-            draw_overflow_chip(context, rect, key, key_actions, hovered, palette);
+            with_icon_atlas(|icon_atlas| {
+                draw_overflow_chip(
+                    context,
+                    rect,
+                    key,
+                    key_actions,
+                    hovered,
+                    icon_atlas,
+                    palette,
+                );
+            });
             state.metrics.hits.push(HitRegion {
                 rect,
                 key: (*key).clone(),
@@ -659,6 +673,7 @@ fn draw_key(
     actions: Option<&Vec<String>>,
     hovered: bool,
     modifier_active: bool,
+    icon_atlas: Option<&IconAtlas>,
     palette: Palette,
 ) {
     rounded_rectangle(context, rect, (rect.height * 0.1).clamp(4.0, 8.0));
@@ -700,21 +715,38 @@ fn draw_key(
     );
 
     if let Some(actions) = actions {
-        let summary = actions.join(" · ");
-        let max_chars = ((rect.width - 10.0) / 6.1).floor().max(4.0) as usize;
-        let lines = wrap_two_lines(&summary, max_chars);
-        let font_size = (rect.height * 0.155).clamp(8.0, 11.5);
-        let start_y = rect.y + rect.height * 0.52 - (lines.len().saturating_sub(1) as f64 * 6.0);
-        for (index, line) in lines.iter().enumerate() {
-            draw_text_centered(
+        let icons = icons_for_actions(actions);
+        if let (Some(atlas), Some(icons)) = (icon_atlas, icons) {
+            draw_action_icons(
                 context,
-                rect.x + rect.width / 2.0,
-                start_y + index as f64 * (font_size + 3.0),
-                line,
-                font_size,
-                FontWeight::Normal,
+                atlas,
+                Rect {
+                    x: rect.x + 5.0,
+                    y: rect.y + rect.height * 0.3,
+                    width: rect.width - 10.0,
+                    height: rect.height * 0.64,
+                },
+                &icons,
                 palette.foreground,
             );
+        } else {
+            let summary = actions.join(" · ");
+            let max_chars = ((rect.width - 10.0) / 6.1).floor().max(4.0) as usize;
+            let lines = wrap_two_lines(&summary, max_chars);
+            let font_size = (rect.height * 0.155).clamp(8.0, 11.5);
+            let start_y =
+                rect.y + rect.height * 0.52 - (lines.len().saturating_sub(1) as f64 * 6.0);
+            for (index, line) in lines.iter().enumerate() {
+                draw_text_centered(
+                    context,
+                    rect.x + rect.width / 2.0,
+                    start_y + index as f64 * (font_size + 3.0),
+                    line,
+                    font_size,
+                    FontWeight::Normal,
+                    palette.foreground,
+                );
+            }
         }
     }
 }
@@ -725,6 +757,7 @@ fn draw_overflow_chip(
     key: &str,
     actions: &[String],
     hovered: bool,
+    icon_atlas: Option<&IconAtlas>,
     palette: Palette,
 ) {
     rounded_rectangle(context, rect, 7.0);
@@ -756,15 +789,62 @@ fn draw_overflow_chip(
         FontWeight::Bold,
         palette.accent,
     );
-    draw_text(
-        context,
-        rect.x + 9.0,
-        rect.y + 31.0,
-        &elide(&actions.join(" · "), ((rect.width - 18.0) / 6.0) as usize),
-        10.0,
-        FontWeight::Normal,
-        palette.foreground,
-    );
+    let icons = icons_for_actions(actions);
+    if let (Some(atlas), Some(icons)) = (icon_atlas, icons) {
+        draw_action_icons(
+            context,
+            atlas,
+            Rect {
+                x: rect.x + 8.0,
+                y: rect.y + 16.0,
+                width: rect.width - 16.0,
+                height: rect.height - 17.0,
+            },
+            &icons,
+            palette.foreground,
+        );
+    } else {
+        draw_text(
+            context,
+            rect.x + 9.0,
+            rect.y + 31.0,
+            &elide(&actions.join(" · "), ((rect.width - 18.0) / 6.0) as usize),
+            10.0,
+            FontWeight::Normal,
+            palette.foreground,
+        );
+    }
+}
+
+fn draw_action_icons(
+    context: &Context,
+    atlas: &IconAtlas,
+    rect: Rect,
+    icons: &[ActionIcon],
+    color: Color,
+) {
+    if icons.is_empty() || rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+
+    let gap = (rect.height * 0.08).clamp(2.0, 4.0);
+    let available_per_icon =
+        (rect.width - gap * icons.len().saturating_sub(1) as f64) / icons.len() as f64;
+    let size = (rect.height * 0.92).min(available_per_icon).max(1.0);
+    let total_width = size * icons.len() as f64 + gap * icons.len().saturating_sub(1) as f64;
+    let start_x = rect.x + (rect.width - total_width) / 2.0;
+    let y = rect.y + (rect.height - size) / 2.0;
+
+    for (index, icon) in icons.iter().enumerate() {
+        atlas.draw(
+            context,
+            *icon,
+            start_x + index as f64 * (size + gap),
+            y,
+            size,
+            color,
+        );
+    }
 }
 
 fn draw_details(

@@ -1,4 +1,5 @@
 mod core;
+mod icons;
 mod system;
 mod ui;
 
