@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::peripherals::{PointingDevices, discover_pointing_devices};
 use serde_json::Value;
 
 use crate::core::{
@@ -18,6 +19,7 @@ pub struct RuntimeSnapshot {
     pub device_name: String,
     pub monitor_connector: Option<String>,
     pub palette: Palette,
+    pub pointing: PointingDevices,
 }
 
 pub fn load_runtime(layout_override: Option<KeyboardLayout>) -> RuntimeSnapshot {
@@ -25,7 +27,8 @@ pub fn load_runtime(layout_override: Option<KeyboardLayout>) -> RuntimeSnapshot 
         Ok(bindings) => (bindings, None),
         Err(error) => (Vec::new(), Some(error)),
     };
-    let devices = discover_keyboards();
+    let registry = hyprland_devices();
+    let devices = discover_keyboards(registry.as_ref());
     let layout = detect_keyboard_layout(layout_override, &devices);
     let device_name = display_device_name(&devices, layout);
 
@@ -36,6 +39,7 @@ pub fn load_runtime(layout_override: Option<KeyboardLayout>) -> RuntimeSnapshot 
         device_name,
         monitor_connector: active_monitor_connector(),
         palette: load_palette(),
+        pointing: discover_pointing_devices(registry.as_ref()),
     }
 }
 
@@ -224,8 +228,8 @@ fn active_monitor_connector() -> Option<String> {
     value.get("monitor")?.as_str().map(str::to_string)
 }
 
-fn discover_keyboards() -> Vec<DeviceCandidate> {
-    let hyprland_names = hyprland_keyboard_names();
+fn discover_keyboards(registry: Option<&Value>) -> Vec<DeviceCandidate> {
+    let hyprland_names = hyprland_keyboard_names(registry);
     let Ok(entries) = fs::read_dir("/sys/class/input") else {
         return Vec::new();
     };
@@ -287,14 +291,17 @@ fn discover_keyboards() -> Vec<DeviceCandidate> {
     devices
 }
 
-fn hyprland_keyboard_names() -> BTreeSet<String> {
-    let Some(value) = Command::new("hyprctl")
+fn hyprland_devices() -> Option<Value> {
+    Command::new("hyprctl")
         .args(["-j", "devices"])
         .output()
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| serde_json::from_slice::<Value>(&output.stdout).ok())
-    else {
+}
+
+fn hyprland_keyboard_names(registry: Option<&Value>) -> BTreeSet<String> {
+    let Some(value) = registry else {
         return BTreeSet::new();
     };
 
@@ -344,7 +351,7 @@ fn read_hex_u16(path: impl AsRef<Path>) -> Option<u16> {
     u16::from_str_radix(&read_trimmed(path)?, 16).ok()
 }
 
-fn normalize_device_name(name: &str) -> String {
+pub(crate) fn normalize_device_name(name: &str) -> String {
     let mut normalized = String::new();
     let mut separator = false;
     for character in name.chars().flat_map(char::to_lowercase) {
@@ -359,7 +366,7 @@ fn normalize_device_name(name: &str) -> String {
     normalized.trim_end_matches('-').to_string()
 }
 
-fn parse_key_bitmap(bitmap: &str) -> BTreeSet<u16> {
+pub(crate) fn parse_key_bitmap(bitmap: &str) -> BTreeSet<u16> {
     let words: Vec<_> = bitmap
         .split_whitespace()
         .filter_map(|word| u64::from_str_radix(word, 16).ok())

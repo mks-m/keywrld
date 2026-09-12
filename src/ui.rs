@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use gtk::cairo::{Context, FontSlant, FontWeight};
@@ -9,10 +9,11 @@ use gtk4 as gtk;
 use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell};
 
 use crate::core::{
-    Binding, Color, KeyboardGeometry, KeyboardLayout, Modifiers, Palette, Rect, actions_for,
-    chord_label, is_mouse_key,
+    Color, KeyboardGeometry, KeyboardLayout, Modifiers, Palette, Rect, actions_for, chord_label,
+    is_mouse_key,
 };
 use crate::icons::{ActionIcon, IconAtlas, icons_for_actions, with_icon_atlas};
+use crate::peripherals::{PeripheralRow, touchpad_rows};
 use crate::system::{RuntimeSnapshot, load_runtime};
 
 #[derive(Clone, Debug)]
@@ -25,7 +26,37 @@ struct HitRegion {
 #[derive(Clone, Debug, Default)]
 struct RenderMetrics {
     panel: Rect,
+    panels: Vec<Rect>,
+    mouse: Rect,
+    touchpad: ScrollMetrics,
+    pointer: Option<(f64, f64)>,
+    rows: Vec<(Rect, String)>,
     hits: Vec<HitRegion>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScrollMetrics {
+    rect: Rect,
+    offset: f64,
+    maximum: f64,
+}
+
+impl RenderMetrics {
+    fn contains_panel(&self, x: f64, y: f64) -> bool {
+        self.panels.iter().any(|panel| panel.contains(x, y))
+    }
+
+    fn scroll(&mut self, delta: f64) -> bool {
+        let Some((x, y)) = self.pointer else {
+            return false;
+        };
+        let area = &mut self.touchpad;
+        if area.rect.width > 0.0 && area.rect.contains(x, y) {
+            area.offset = (area.offset + delta * 40.0).clamp(0.0, area.maximum);
+            return true;
+        }
+        false
+    }
 }
 
 struct OverlayState {
@@ -162,6 +193,28 @@ fn build_window(
                 .find(|hit| hit.rect.contains(x, y))
                 .map(|hit| hit.key.clone());
             let mut state = state.borrow_mut();
+            state.metrics.pointer = Some((x, y));
+            let tooltip = state
+                .metrics
+                .hits
+                .iter()
+                .find(|hit| hit.rect.contains(x, y) && is_mouse_key(&hit.key))
+                .map(|hit| {
+                    mouse_tooltip(
+                        hit,
+                        &actions_for(&state.snapshot.bindings, state.modifiers),
+                        state.modifiers,
+                    )
+                })
+                .or_else(|| {
+                    state
+                        .metrics
+                        .rows
+                        .iter()
+                        .find(|(rect, _)| rect.contains(x, y))
+                        .map(|(_, text)| text.clone())
+                });
+            drawing_area.set_tooltip_text(tooltip.as_deref());
             if state.hovered != hovered {
                 state.hovered = hovered;
                 drawing_area.queue_draw();
@@ -172,6 +225,8 @@ fn build_window(
         let state = state.clone();
         let drawing_area = drawing_area.clone();
         move |_| {
+            state.borrow_mut().metrics.pointer = None;
+            drawing_area.set_tooltip_text(None);
             if state.borrow().hovered.is_some() {
                 state.borrow_mut().hovered = None;
                 drawing_area.queue_draw();
@@ -179,6 +234,22 @@ fn build_window(
         }
     });
     drawing_area.add_controller(motion);
+
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    scroll.connect_scroll({
+        let state = state.clone();
+        let drawing_area = drawing_area.clone();
+        move |_, _, dy| {
+            if state.borrow_mut().metrics.scroll(dy) {
+                drawing_area.set_tooltip_text(None);
+                drawing_area.queue_draw();
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        }
+    });
+    drawing_area.add_controller(scroll);
 
     let click = gtk::GestureClick::new();
     click.connect_released({
@@ -195,7 +266,7 @@ fn build_window(
                 .and_then(|hit| modifier_for_key_id(&hit.key));
             if let Some(modifier) = clicked_modifier {
                 toggle_latched_modifier(&state, &drawing_area, modifier);
-            } else if !state.borrow().metrics.panel.contains(x, y)
+            } else if !state.borrow().metrics.contains_panel(x, y)
                 && let Some(window) = window.upgrade()
             {
                 window.close();
@@ -330,6 +401,7 @@ fn update_held_modifiers(
         state.held_modifiers = held_modifiers;
         state.modifiers = modifiers;
         state.hovered = None;
+        drawing_area.set_tooltip_text(None);
         drawing_area.queue_draw();
     }
 }
@@ -343,6 +415,7 @@ fn toggle_latched_modifier(
     state.latched_modifiers = state.latched_modifiers.toggled(modifier);
     state.modifiers = state.latched_modifiers.with(state.held_modifiers);
     state.hovered = None;
+    drawing_area.set_tooltip_text(None);
     drawing_area.queue_draw();
 }
 
@@ -357,19 +430,14 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
         .iter()
         .filter(|(key, _)| !geometry_ids.contains(key.as_str()) && !is_mouse_key(key))
         .collect();
-    let mut mouse_bindings: Vec<_> = state
+    // Keep the diagram geometry stable while only its actions follow modifiers.
+    let mouse_keys: BTreeSet<_> = state
         .snapshot
         .bindings
         .iter()
         .filter(|binding| is_mouse_key(&binding.key))
-        .cloned()
+        .map(|binding| binding.key.clone())
         .collect();
-    mouse_bindings.sort_by(|left, right| {
-        left.modifiers
-            .cmp(&right.modifiers)
-            .then_with(|| left.key.cmp(&right.key))
-            .then_with(|| left.action.cmp(&right.action))
-    });
 
     let outer_padding = 24.0;
     let header_height = 82.0;
@@ -383,62 +451,30 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
     } else {
         chip_rows as f64 * chip_height + 12.0
     };
-    let side_gap = if mouse_bindings.is_empty() { 0.0 } else { 18.0 };
-    let mouse_panel_width = if mouse_bindings.is_empty() {
-        0.0
+    let touch_rows = if state.snapshot.pointing.touchpads.is_empty() {
+        Vec::new()
     } else {
-        (width * 0.18).clamp(240.0, 310.0)
+        touchpad_rows(&state.snapshot.pointing, &state.snapshot.bindings)
     };
-
-    let available_width =
-        (width * 0.94 - mouse_panel_width - side_gap - outer_padding * 2.0).max(320.0);
-    let available_height =
-        (height * 0.9 - header_height - detail_height - overflow_height - outer_padding * 2.0)
-            .max(180.0);
-    let unit = (available_width / state.geometry.width)
-        .min(available_height / state.geometry.height)
-        .min(78.0);
+    let layout = panel_layout(
+        width,
+        height,
+        &state.geometry,
+        overflow_height,
+        !mouse_keys.is_empty() || !state.snapshot.pointing.mice.is_empty(),
+        touch_rows.len(),
+        state.snapshot.pointing.mouse_left,
+    );
+    let panel = layout.keyboard;
+    let unit = layout.unit;
     let board_width = state.geometry.width * unit;
     let board_height = state.geometry.height * unit;
-    let panel_width = board_width + outer_padding * 2.0;
-    let panel_height =
-        header_height + board_height + overflow_height + detail_height + outer_padding * 2.0;
-    let total_width = panel_width + side_gap + mouse_panel_width;
-    let panel = Rect {
-        x: (width - total_width) / 2.0,
-        y: (height - panel_height) / 2.0,
-        width: panel_width,
-        height: panel_height,
-    };
-    let mouse_row_height = if mouse_bindings.is_empty() {
-        0.0
-    } else {
-        ((height * 0.82 - 72.0) / mouse_bindings.len() as f64).clamp(40.0, 52.0)
-    };
-    let mouse_panel_height = if mouse_bindings.is_empty() {
-        0.0
-    } else {
-        72.0 + mouse_row_height * mouse_bindings.len() as f64
-    };
-    let mouse_panel = Rect {
-        x: panel.x + panel.width + side_gap,
-        y: (height - mouse_panel_height) / 2.0,
-        width: mouse_panel_width,
-        height: mouse_panel_height,
-    };
-    state.metrics.panel = if mouse_bindings.is_empty() {
-        panel
-    } else {
-        let top = panel.y.min(mouse_panel.y);
-        let bottom = (panel.y + panel.height).max(mouse_panel.y + mouse_panel.height);
-        Rect {
-            x: panel.x,
-            y: top,
-            width: total_width,
-            height: bottom - top,
-        }
-    };
+    state.metrics.panel = panel;
+    state.metrics.panels = vec![panel];
+    state.metrics.panels.extend(layout.mouse);
+    state.metrics.panels.extend(layout.touchpad);
     state.metrics.hits.clear();
+    state.metrics.rows.clear();
 
     rounded_rectangle(context, panel, 18.0);
     set_source(context, palette.background.with_alpha(0.985));
@@ -521,6 +557,13 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
         }
     }
 
+    if let Some(panel) = layout.mouse {
+        state.metrics.mouse = panel;
+        draw_mouse_panel(context, panel, &mouse_keys, &actions, state);
+    } else {
+        state.metrics.mouse = Rect::default();
+    }
+
     let detail_y = board_y + board_height + overflow_height + 10.0;
     draw_details(
         context,
@@ -535,31 +578,193 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
         palette,
     );
 
-    if !mouse_bindings.is_empty() {
-        draw_mouse_panel(
+    if let Some(panel) = layout.touchpad {
+        draw_peripheral_panel(
             context,
-            mouse_panel,
-            mouse_row_height,
-            &mouse_bindings,
+            panel,
+            "TOUCHPAD",
+            "Clicks, scrolling and configured gestures",
+            &touch_rows,
+            &mut state.metrics.touchpad,
+            &mut state.metrics.rows,
             palette,
         );
+    } else {
+        state.metrics.touchpad = ScrollMetrics::default();
     }
+}
+
+struct PanelLayout {
+    keyboard: Rect,
+    mouse: Option<Rect>,
+    touchpad: Option<Rect>,
+    unit: f64,
+}
+
+fn panel_layout(
+    width: f64,
+    height: f64,
+    geometry: &KeyboardGeometry,
+    overflow: f64,
+    show_mouse: bool,
+    touch_rows: usize,
+    left: bool,
+) -> PanelLayout {
+    let gap = 24.0;
+    let margin = (width.min(height) * 0.03).max(16.0);
+    let available_height = (height - 2.0 * margin).max(1.0);
+    let mouse_width = if !show_mouse {
+        0.0
+    } else {
+        (width * 0.22).clamp(210.0, 310.0).min(width * 0.35)
+    };
+    let side = if !show_mouse { 0.0 } else { mouse_width + gap };
+    let touch_height = if touch_rows == 0 {
+        0.0
+    } else {
+        (72.0 + touch_rows as f64 * 48.0).min(available_height * 0.28)
+    };
+    let below = if touch_rows == 0 {
+        0.0
+    } else {
+        touch_height + gap
+    };
+    let chrome = 82.0 + 66.0 + 48.0 + overflow;
+    let unit = ((width - 2.0 * margin - side - 48.0) / geometry.width)
+        .min((available_height - below - chrome) / geometry.height)
+        .clamp(1.0, 78.0);
+    let keyboard_width = geometry.width * unit + 48.0;
+    let keyboard_height = geometry.height * unit + chrome;
+    let x = (width - keyboard_width - side) / 2.0;
+    let keyboard = Rect {
+        x: x + if left { side } else { 0.0 },
+        y: (height - keyboard_height - below) / 2.0,
+        width: keyboard_width,
+        height: keyboard_height,
+    };
+    let mouse = show_mouse.then(|| {
+        let panel_height = 450.0_f64.min(keyboard_height);
+        Rect {
+            x: if left {
+                x
+            } else {
+                keyboard.x + keyboard.width + gap
+            },
+            y: keyboard.y + (keyboard.height - panel_height) / 2.0,
+            width: mouse_width,
+            height: panel_height,
+        }
+    });
+    let touch_width = keyboard.width.min(720.0);
+    let touchpad = (touch_rows > 0).then_some(Rect {
+        x: keyboard.x + (keyboard.width - touch_width) / 2.0,
+        y: keyboard.y + keyboard.height + gap,
+        width: touch_width,
+        height: touch_height,
+    });
+    PanelLayout {
+        keyboard,
+        mouse,
+        touchpad,
+        unit,
+    }
+}
+
+/// A normalized mouse silhouette; optional controls are based on all registered
+/// bindings, never the currently selected chord.
+fn mouse_geometry(panel: Rect, keys: &BTreeSet<String>) -> (Rect, Vec<HitRegion>) {
+    let scale = ((panel.width - 32.0) / 220.0)
+        .min((panel.height - 150.0) / 280.0)
+        .max(0.1);
+    let x = panel.x + (panel.width - 220.0 * scale) / 2.0;
+    let y = panel.y + 66.0;
+    let map = |x0, y0, width, height| Rect {
+        x: x + x0 * scale,
+        y: y + y0 * scale,
+        width: width * scale,
+        height: height * scale,
+    };
+    let mut controls = Vec::new();
+    let mut add = |key: &str, legend: &str, x, y, width, height| {
+        controls.push(HitRegion {
+            key: key.into(),
+            legend: legend.into(),
+            rect: map(x, y, width, height),
+        })
+    };
+    add("MOUSE_LEFT", "Left click", 34.0, 40.0, 56.0, 110.0);
+    add("MOUSE_RIGHT", "Right click", 130.0, 40.0, 56.0, 110.0);
+    add("MOUSE_UP", "Wheel up", 96.0, 47.0, 28.0, 28.0);
+    add("MOUSE_MIDDLE", "Wheel click", 96.0, 79.0, 28.0, 32.0);
+    add("MOUSE_DOWN", "Wheel down", 96.0, 115.0, 28.0, 28.0);
+    for (key, legend, x) in [
+        ("MOUSE_SCROLL_LEFT", "Wheel left", 62.0),
+        ("MOUSE_SCROLL_RIGHT", "Wheel right", 124.0),
+    ] {
+        if keys.contains(key) {
+            add(key, legend, x, 157.0, 34.0, 30.0);
+        }
+    }
+    // Standard thumb buttons sit on the flank of the mouse.
+    for (key, legend, y) in [
+        ("MOUSE:275", "Button 4", 156.0),
+        ("MOUSE:276", "Button 5", 202.0),
+    ] {
+        if keys.contains(key) {
+            add(key, legend, 12.0, y, 18.0, 38.0);
+        }
+    }
+    let represented: BTreeSet<_> = controls.iter().map(|hit| hit.key.as_str()).collect();
+    let extra: Vec<_> = keys
+        .iter()
+        .filter(|key| !represented.contains(key.as_str()))
+        .collect();
+    let rows = extra.len().div_ceil(3).max(1);
+    let cell_height = 60.0 / rows as f64;
+    for (index, key) in extra.into_iter().enumerate() {
+        controls.push(HitRegion {
+            key: key.clone(),
+            legend: friendly_key_name(key),
+            rect: map(
+                48.0 + (index % 3) as f64 * 43.0,
+                202.0 + (index / 3) as f64 * cell_height,
+                38.0,
+                cell_height - 3.0,
+            ),
+        });
+    }
+    (map(26.0, 22.0, 168.0, 246.0), controls)
+}
+
+fn mouse_tooltip(
+    hit: &HitRegion,
+    actions: &BTreeMap<String, Vec<String>>,
+    modifiers: Modifiers,
+) -> String {
+    format!(
+        "{}\n{}",
+        chord_label(modifiers, &hit.legend),
+        actions
+            .get(&hit.key)
+            .map(|a| a.join(" · "))
+            .unwrap_or_else(|| "No binding".into())
+    )
 }
 
 fn draw_mouse_panel(
     context: &Context,
     panel: Rect,
-    row_height: f64,
-    bindings: &[Binding],
-    palette: Palette,
+    keys: &BTreeSet<String>,
+    actions: &BTreeMap<String, Vec<String>>,
+    state: &mut OverlayState,
 ) {
+    let palette = state.snapshot.palette;
     rounded_rectangle(context, panel, 16.0);
     set_source(context, palette.background.with_alpha(0.985));
     let _ = context.fill_preserve();
     context.set_line_width(1.0);
     set_source(context, palette.muted.with_alpha(0.9));
     let _ = context.stroke();
-
     draw_text(
         context,
         panel.x + 18.0,
@@ -569,36 +774,277 @@ fn draw_mouse_panel(
         FontWeight::Bold,
         palette.foreground,
     );
+    let subtitle = state
+        .snapshot
+        .pointing
+        .mice
+        .first()
+        .map(String::as_str)
+        .unwrap_or("Buttons and scroll wheel");
     draw_text(
         context,
         panel.x + 18.0,
         panel.y + 49.0,
-        &format!("{} global bindings", bindings.len()),
+        &elide(subtitle, ((panel.width - 36.0) / 6.0) as usize),
         11.0,
         FontWeight::Normal,
         palette.dark_foreground,
     );
+    let (body, controls) = mouse_geometry(panel, keys);
+    let cx = body.x + body.width / 2.0;
+    // Cable and a rounded shell make the controls read as a mouse, not a grid.
+    context.move_to(cx, body.y - 16.0);
+    context.line_to(cx, body.y);
+    context.set_line_width(2.0);
+    set_source(context, palette.muted);
+    let _ = context.stroke();
+    let top_radius = body.width * 0.2;
+    let bottom_radius = body.width * 0.5;
+    let right = body.x + body.width;
+    let bottom = body.y + body.height;
+    context.new_sub_path();
+    context.move_to(body.x + top_radius, body.y);
+    context.line_to(right - top_radius, body.y);
+    context.curve_to(right, body.y, right, body.y, right, body.y + top_radius);
+    context.line_to(right, bottom - bottom_radius);
+    context.curve_to(right, bottom, right, bottom, cx, bottom);
+    context.curve_to(
+        body.x,
+        bottom,
+        body.x,
+        bottom,
+        body.x,
+        bottom - bottom_radius,
+    );
+    context.line_to(body.x, body.y + top_radius);
+    context.curve_to(body.x, body.y, body.x, body.y, body.x + top_radius, body.y);
+    context.close_path();
+    set_source(context, palette.darker_background.with_alpha(0.65));
+    let _ = context.fill_preserve();
+    set_source(context, palette.muted);
+    context.set_line_width(1.5);
+    let _ = context.stroke();
 
-    for (index, binding) in bindings.iter().enumerate() {
-        let rect = Rect {
-            x: panel.x + 12.0,
-            y: panel.y + 62.0 + index as f64 * row_height,
-            width: panel.width - 24.0,
-            height: row_height - 6.0,
+    // Enclose the three wheel targets in one scroll-wheel housing.
+    let up = controls
+        .iter()
+        .find(|hit| hit.key == "MOUSE_UP")
+        .unwrap()
+        .rect;
+    let down = controls
+        .iter()
+        .find(|hit| hit.key == "MOUSE_DOWN")
+        .unwrap()
+        .rect;
+    let housing = Rect {
+        x: up.x - 4.0,
+        y: up.y - 5.0,
+        width: up.width + 8.0,
+        height: down.y + down.height - up.y + 10.0,
+    };
+    rounded_rectangle(context, housing, housing.width / 2.0);
+    set_source(context, palette.lighter_background);
+    let _ = context.fill_preserve();
+    set_source(context, palette.muted);
+    context.set_line_width(1.0);
+    let _ = context.stroke();
+
+    let selected = if state.modifiers.is_empty() {
+        "NO MODIFIERS".into()
+    } else {
+        state.modifiers.label()
+    };
+    draw_text_centered(
+        context,
+        cx,
+        body.y + body.height * 0.71,
+        &selected,
+        (body.width / 18.0).clamp(7.0, 10.0),
+        FontWeight::Bold,
+        palette.dark_foreground,
+    );
+    for hit in &controls {
+        let key_actions = actions.get(&hit.key);
+        let hovered = state.hovered.as_deref() == Some(hit.key.as_str());
+        let symbol = match hit.key.as_str() {
+            "MOUSE_LEFT" => "L",
+            "MOUSE_RIGHT" => "R",
+            "MOUSE_UP" => "↑",
+            "MOUSE_DOWN" => "↓",
+            "MOUSE_MIDDLE" => "●",
+            "MOUSE_SCROLL_LEFT" => "←",
+            "MOUSE_SCROLL_RIGHT" => "→",
+            "MOUSE:275" => "4",
+            "MOUSE:276" => "5",
+            _ => "•",
         };
+        let _ = context.save();
+        // Unknown/long action text must never spill into neighboring controls.
+        context.rectangle(hit.rect.x, hit.rect.y, hit.rect.width, hit.rect.height);
+        context.clip();
+        with_icon_atlas(|atlas| {
+            // A tiny wheel/side target cannot fit an unknown action's name;
+            // its full text remains available in both details and the tooltip.
+            let compact_summary = vec!["…".to_string()];
+            let display_actions = if hit.rect.width < 40.0
+                && key_actions.is_some_and(|a| icons_for_actions(a).is_none())
+            {
+                Some(&compact_summary)
+            } else {
+                key_actions
+            };
+            draw_key(
+                context,
+                hit.rect,
+                symbol,
+                display_actions,
+                hovered,
+                false,
+                atlas,
+                palette,
+            )
+        });
+        let _ = context.restore();
+    }
+    let hovered = controls
+        .iter()
+        .find(|hit| state.hovered.as_deref() == Some(hit.key.as_str()));
+    let footer = Rect {
+        x: panel.x + 12.0,
+        y: panel.y + panel.height - 78.0,
+        width: panel.width - 24.0,
+        height: 66.0,
+    };
+    rounded_rectangle(context, footer, 8.0);
+    set_source(context, palette.darker_background.with_alpha(0.72));
+    let _ = context.fill();
+    if let Some(hit) = hovered {
+        draw_text(
+            context,
+            footer.x + 10.0,
+            footer.y + 18.0,
+            &elide(
+                &chord_label(state.modifiers, &hit.legend),
+                ((footer.width - 20.0) / 6.0) as usize,
+            ),
+            10.0,
+            FontWeight::Bold,
+            palette.accent,
+        );
+        let text = actions
+            .get(&hit.key)
+            .map(|a| a.join(" · "))
+            .unwrap_or_else(|| "No binding".into());
+        for (i, line) in wrap_two_lines(&text, ((footer.width - 20.0) / 6.0) as usize)
+            .iter()
+            .enumerate()
+        {
+            draw_text(
+                context,
+                footer.x + 10.0,
+                footer.y + 35.0 + i as f64 * 14.0,
+                line,
+                10.5,
+                FontWeight::Normal,
+                palette.foreground,
+            );
+        }
+    } else {
+        let count = controls
+            .iter()
+            .filter(|hit| actions.contains_key(&hit.key))
+            .count();
+        draw_text(
+            context,
+            footer.x + 10.0,
+            footer.y + 23.0,
+            &if count == 0 {
+                "No bindings for this chord".into()
+            } else {
+                format!("{count} bound controls")
+            },
+            11.0,
+            FontWeight::Bold,
+            palette.foreground,
+        );
+        draw_text(
+            context,
+            footer.x + 10.0,
+            footer.y + 43.0,
+            "Hover a button or wheel",
+            10.5,
+            FontWeight::Normal,
+            palette.dark_foreground,
+        );
+    }
+    state.metrics.hits.extend(controls);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_peripheral_panel(
+    context: &Context,
+    panel: Rect,
+    title: &str,
+    subtitle: &str,
+    rows: &[PeripheralRow],
+    scroll: &mut ScrollMetrics,
+    row_hits: &mut Vec<(Rect, String)>,
+    palette: Palette,
+) {
+    rounded_rectangle(context, panel, 16.0);
+    set_source(context, palette.background.with_alpha(0.985));
+    let _ = context.fill_preserve();
+    context.set_line_width(1.0);
+    set_source(context, palette.muted.with_alpha(0.9));
+    let _ = context.stroke();
+    draw_text(
+        context,
+        panel.x + 18.0,
+        panel.y + 29.0,
+        title,
+        15.0,
+        FontWeight::Bold,
+        palette.foreground,
+    );
+    draw_text(
+        context,
+        panel.x + 18.0,
+        panel.y + 49.0,
+        &elide(subtitle, ((panel.width - 36.0) / 6.0) as usize),
+        11.0,
+        FontWeight::Normal,
+        palette.dark_foreground,
+    );
+    let viewport = Rect {
+        x: panel.x + 12.0,
+        y: panel.y + 62.0,
+        width: panel.width - 24.0,
+        height: (panel.height - 72.0).max(0.0),
+    };
+    scroll.rect = panel;
+    scroll.maximum = (rows.len() as f64 * 48.0 - viewport.height).max(0.0);
+    scroll.offset = scroll.offset.clamp(0.0, scroll.maximum);
+    let _ = context.save();
+    context.rectangle(viewport.x, viewport.y, viewport.width, viewport.height);
+    context.clip();
+    for (index, row) in rows.iter().enumerate() {
+        let rect = Rect {
+            x: viewport.x,
+            y: viewport.y + index as f64 * 48.0 - scroll.offset,
+            width: viewport.width - 8.0,
+            height: 42.0,
+        };
+        if rect.y + rect.height <= viewport.y || rect.y >= viewport.y + viewport.height {
+            continue;
+        }
         rounded_rectangle(context, rect, 7.0);
         set_source(context, palette.darker_background.with_alpha(0.58));
         let _ = context.fill();
-
-        let key = friendly_key_name(&binding.key);
         draw_text(
             context,
             rect.x + 10.0,
             rect.y + 15.0,
-            &elide(
-                &chord_label(binding.modifiers, &key),
-                ((rect.width - 20.0) / 6.0) as usize,
-            ),
+            &elide(&row.label, ((rect.width - 20.0) / 6.0) as usize),
             10.0,
             FontWeight::Bold,
             palette.accent,
@@ -607,12 +1053,37 @@ fn draw_mouse_panel(
             context,
             rect.x + 10.0,
             rect.y + 32.0,
-            &elide(&binding.action, ((rect.width - 20.0) / 5.8) as usize),
+            &elide(&row.action, ((rect.width - 20.0) / 5.8) as usize),
             10.5,
             FontWeight::Normal,
             palette.foreground,
         );
+        let top = rect.y.max(viewport.y);
+        let bottom = (rect.y + rect.height).min(viewport.y + viewport.height);
+        row_hits.push((
+            Rect {
+                y: top,
+                height: bottom - top,
+                ..rect
+            },
+            format!("{}\n{}", row.label, row.action),
+        ));
     }
+    if scroll.maximum > 0.0 {
+        let thumb_height = (viewport.height * viewport.height / (rows.len() as f64 * 48.0))
+            .max(16.0)
+            .min(viewport.height);
+        let thumb = Rect {
+            x: viewport.x + viewport.width - 4.0,
+            y: viewport.y + (viewport.height - thumb_height) * scroll.offset / scroll.maximum,
+            width: 3.0,
+            height: thumb_height,
+        };
+        rounded_rectangle(context, thumb, 1.5);
+        set_source(context, palette.accent.with_alpha(0.65));
+        let _ = context.fill();
+    }
+    let _ = context.restore();
 }
 
 fn draw_header(
@@ -911,7 +1382,7 @@ fn draw_details(
                 context,
                 rect.x + 14.0,
                 rect.y + 33.0,
-                "Hover a key for its complete shortcut and action",
+                "Hover a key or mouse control for its shortcut and action",
                 13.0,
                 FontWeight::Normal,
                 palette.dark_foreground,
@@ -950,11 +1421,19 @@ fn modifier_for_key_id(key: &str) -> Option<Modifiers> {
 
 fn friendly_key_name(key: &str) -> String {
     match key {
-        "MOUSE_DOWN" => "Mouse wheel down".into(),
-        "MOUSE_UP" => "Mouse wheel up".into(),
-        "MOUSE_LEFT" => "Left mouse button".into(),
-        "MOUSE_RIGHT" => "Right mouse button".into(),
-        "MOUSE_MIDDLE" => "Middle mouse button".into(),
+        "MOUSE_SCROLL_LEFT" => "Wheel left".into(),
+        "MOUSE_SCROLL_RIGHT" => "Wheel right".into(),
+        "MOUSE_DOWN" => "Wheel down".into(),
+        "MOUSE_UP" => "Wheel up".into(),
+        "MOUSE_LEFT" => "Left click".into(),
+        "MOUSE_RIGHT" => "Right click".into(),
+        "MOUSE_MIDDLE" => "Middle click".into(),
+        value if value.starts_with("MOUSE:") => value[6..]
+            .parse::<u16>()
+            .ok()
+            .and_then(|code| code.checked_sub(271))
+            .map(|button| format!("Button {button}"))
+            .unwrap_or_else(|| value.into()),
         value if value.starts_with("XF86") => value.trim_start_matches("XF86").into(),
         value => value.replace('_', " ").to_ascii_lowercase(),
     }
@@ -1108,6 +1587,7 @@ fn draw_text_right(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Binding;
     use gtk::cairo::{Format, ImageSurface};
 
     #[test]
@@ -1224,56 +1704,386 @@ mod tests {
     }
 
     #[test]
-    fn mouse_card_does_not_change_with_the_selected_keyboard_chord() {
+    fn mouse_diagram_follows_exact_modifiers_and_keeps_geometry_stable() {
         let surface = ImageSurface::create(Format::ARgb32, 1920, 1080).unwrap();
         let context = Context::new(&surface).unwrap();
-        let bindings = [
-            (Modifiers::SUPER, "MOUSE_DOWN", "Next workspace"),
-            (Modifiers::SUPER, "MOUSE_UP", "Previous workspace"),
-            (Modifiers::SUPER, "MOUSE_LEFT", "Move window"),
-            (Modifiers::SUPER, "MOUSE_RIGHT", "Resize window"),
+        let mut state = fixture_state(KeyboardLayout::Tkl, false, false);
+        state.snapshot.bindings.push(Binding {
+            modifiers: Modifiers::default(),
+            key: "MOUSE_MIDDLE".into(),
+            action: "Middle action".into(),
+        });
+        draw_overlay(&context, 1920.0, 1080.0, &mut state);
+        let panel = state.metrics.mouse;
+        let regions: Vec<_> = state
+            .metrics
+            .hits
+            .iter()
+            .filter(|hit| is_mouse_key(&hit.key))
+            .map(|hit| (hit.key.clone(), hit.rect))
+            .collect();
+        assert_eq!(regions.len(), 5);
+        let wheel = state
+            .metrics
+            .hits
+            .iter()
+            .find(|hit| hit.key == "MOUSE_UP")
+            .unwrap()
+            .clone();
+        let keys = state
+            .snapshot
+            .bindings
+            .iter()
+            .filter(|b| is_mouse_key(&b.key))
+            .map(|b| b.key.clone())
+            .collect();
+        let mut images = Vec::new();
+        for (modifiers, expected) in [
+            (Modifiers::SUPER, "Previous workspace"),
             (
                 Modifiers::SUPER.with(Modifiers::ALT),
-                "MOUSE_DOWN",
-                "Next group window",
-            ),
-            (
-                Modifiers::SUPER.with(Modifiers::ALT),
-                "MOUSE_UP",
                 "Previous group window",
             ),
+            (Modifiers::ALT, "No binding"),
+            (Modifiers::default(), "No binding"),
+        ] {
+            state.modifiers = modifiers;
+            let actions = actions_for(&state.snapshot.bindings, modifiers);
+            assert!(mouse_tooltip(&wheel, &actions, modifiers).ends_with(expected));
+            let mouse_surface = ImageSurface::create(Format::ARgb32, 1920, 1080).unwrap();
+            let mouse_context = Context::new(&mouse_surface).unwrap();
+            draw_mouse_panel(&mouse_context, panel, &keys, &actions, &mut state);
+            let mut png = Vec::new();
+            mouse_surface.write_to_png(&mut png).unwrap();
+            images.push(png);
+            draw_overlay(&context, 1920.0, 1080.0, &mut state);
+            assert_eq!(panel, state.metrics.mouse);
+            assert_eq!(
+                regions,
+                state
+                    .metrics
+                    .hits
+                    .iter()
+                    .filter(|hit| is_mouse_key(&hit.key))
+                    .map(|hit| (hit.key.clone(), hit.rect))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(images.windows(2).all(|pair| pair[0] != pair[1]));
+        let middle = state
+            .metrics
+            .hits
+            .iter()
+            .find(|hit| hit.key == "MOUSE_MIDDLE")
+            .unwrap();
+        assert!(
+            mouse_tooltip(
+                middle,
+                &actions_for(&state.snapshot.bindings, Modifiers::default()),
+                Modifiers::default()
+            )
+            .ends_with("Middle action")
+        );
+    }
+
+    #[test]
+    fn mouse_geometry_preserves_optional_controls_on_both_sides() {
+        let keys = [
+            "MOUSE_SCROLL_LEFT",
+            "MOUSE_SCROLL_RIGHT",
+            "MOUSE:275",
+            "MOUSE:276",
+            "MOUSE:277",
         ]
         .into_iter()
-        .map(|(modifiers, key, action)| Binding {
-            modifiers,
-            key: key.into(),
-            action: action.into(),
-        })
+        .map(str::to_string)
         .collect();
-        let mut state = OverlayState {
+        for left in [false, true] {
+            let layout = panel_layout(
+                1024.0,
+                600.0,
+                &KeyboardGeometry::new(KeyboardLayout::Full),
+                0.0,
+                true,
+                10,
+                left,
+            );
+            let panel = layout.mouse.unwrap();
+            let (_, controls) = mouse_geometry(panel, &keys);
+            for key in &keys {
+                assert!(controls.iter().any(|hit| &hit.key == key));
+            }
+            for (index, a) in controls.iter().enumerate() {
+                assert!(
+                    panel.contains(a.rect.x, a.rect.y)
+                        && panel.contains(a.rect.x + a.rect.width, a.rect.y + a.rect.height)
+                );
+                for b in controls.iter().skip(index + 1) {
+                    assert!(
+                        a.rect.x + a.rect.width <= b.rect.x
+                            || b.rect.x + b.rect.width <= a.rect.x
+                            || a.rect.y + a.rect.height <= b.rect.y
+                            || b.rect.y + b.rect.height <= a.rect.y
+                    );
+                }
+            }
+        }
+    }
+
+    fn fixture_state(layout: KeyboardLayout, left: bool, touchpad: bool) -> OverlayState {
+        use crate::peripherals::{
+            DiscoveryStatus, GestureBinding, GestureDiscovery, PointingDevices, Touchpad,
+        };
+        let bindings = crate::core::parse_bindings(
+            "SUPER + RETURN → Terminal\nSUPER + B → Browser\nSUPER + Q → Close window\nSUPER + mouse:272 → Move window\nSUPER + mouse:273 → Resize window\nSUPER + mouse_up → Previous workspace\nSUPER + mouse_down → Next workspace\nSUPER ALT + mouse_up → Previous group window\nSUPER ALT + mouse_down → Next group window",
+        );
+        let pointing = PointingDevices {
+            mice: vec!["Example mouse".into()],
+            mouse_left: left,
+            touchpads: if touchpad {
+                vec![Touchpad {
+                    name: "Example precision touchpad".into(),
+                    settings: BTreeMap::from([
+                        ("tap_to_click".into(), "true".into()),
+                        ("tap_button_map".into(), "lrm".into()),
+                        ("clickfinger_behavior".into(), "true".into()),
+                        ("natural_scroll".into(), "true".into()),
+                        ("scroll_method".into(), "2fg".into()),
+                    ]),
+                }]
+            } else {
+                Vec::new()
+            },
+            gestures: GestureDiscovery {
+                status: DiscoveryStatus::Complete,
+                bindings: vec![GestureBinding {
+                    fingers: 3,
+                    direction: "horizontal".into(),
+                    modifiers: Modifiers::default(),
+                    action: "Switch workspaces".into(),
+                    scale: "1".into(),
+                }],
+            },
+        };
+        OverlayState {
             snapshot: RuntimeSnapshot {
                 bindings,
                 binding_error: None,
-                layout: KeyboardLayout::Tkl,
-                device_name: "Test keyboard · TKL".into(),
+                layout,
+                device_name: format!("Example keyboard · {}", layout.label()),
                 monitor_connector: None,
                 palette: Palette::default(),
+                pointing,
             },
-            geometry: KeyboardGeometry::new(KeyboardLayout::Tkl),
+            geometry: KeyboardGeometry::new(layout),
             latched_modifiers: Modifiers::default(),
             held_modifiers: Modifiers::SUPER,
             modifiers: Modifiers::SUPER,
             hovered: None,
             metrics: RenderMetrics::default(),
-        };
+        }
+    }
 
-        draw_overlay(&context, 1920.0, 1080.0, &mut state);
-        let super_panel = state.metrics.panel;
-        assert!(state.metrics.hits.iter().all(|hit| !is_mouse_key(&hit.key)));
+    #[test]
+    fn panel_layout_keeps_all_devices_on_screen_and_gaps_outside_hit_regions() {
+        for keyboard in [
+            KeyboardLayout::Full,
+            KeyboardLayout::Tkl,
+            KeyboardLayout::Compact75,
+            KeyboardLayout::Compact65,
+            KeyboardLayout::Compact60,
+        ] {
+            for (width, height) in [(1920.0, 1080.0), (1280.0, 720.0), (1024.0, 600.0)] {
+                for left in [false, true] {
+                    for touch in [0, 20] {
+                        let layout = panel_layout(
+                            width,
+                            height,
+                            &KeyboardGeometry::new(keyboard),
+                            58.0,
+                            true,
+                            touch,
+                            left,
+                        );
+                        let mut panels = vec![layout.keyboard];
+                        panels.extend(layout.mouse);
+                        panels.extend(layout.touchpad);
+                        for panel in &panels {
+                            assert!(
+                                panel.x >= 0.0
+                                    && panel.y >= 0.0
+                                    && panel.x + panel.width <= width + 0.01
+                                    && panel.y + panel.height <= height + 0.01
+                            );
+                        }
+                        for (i, a) in panels.iter().enumerate() {
+                            for b in panels.iter().skip(i + 1) {
+                                assert!(
+                                    a.x + a.width <= b.x
+                                        || b.x + b.width <= a.x
+                                        || a.y + a.height <= b.y
+                                        || b.y + b.height <= a.y
+                                );
+                            }
+                        }
+                        let mouse = layout.mouse.unwrap();
+                        let keyboard = layout.keyboard;
+                        assert!(
+                            (mouse.y + mouse.height / 2.0 - keyboard.y - keyboard.height / 2.0)
+                                .abs()
+                                < 0.001
+                        );
+                        let gap_x = if left {
+                            mouse.x + mouse.width + 12.0
+                        } else {
+                            keyboard.x + keyboard.width + 12.0
+                        };
+                        let metrics = RenderMetrics {
+                            panels,
+                            ..Default::default()
+                        };
+                        assert!(!metrics.contains_panel(gap_x, mouse.y + mouse.height / 2.0));
+                        assert!(metrics.contains_panel(mouse.x + 1.0, mouse.y + 1.0));
+                        if let Some(pad) = layout.touchpad {
+                            assert!(
+                                (pad.x + pad.width / 2.0 - keyboard.x - keyboard.width / 2.0).abs()
+                                    < 0.001
+                            );
+                            assert!(!metrics.contains_panel(pad.x + 20.0, pad.y - 12.0));
+                        }
+                    }
+                }
+            }
+        }
+        let layout = panel_layout(
+            1280.0,
+            720.0,
+            &KeyboardGeometry::new(KeyboardLayout::Tkl),
+            0.0,
+            false,
+            0,
+            false,
+        );
+        assert!(layout.mouse.is_none() && layout.touchpad.is_none());
+    }
 
-        state.held_modifiers = Modifiers::SUPER.with(Modifiers::ALT);
-        state.modifiers = state.held_modifiers;
+    #[test]
+    fn touchpad_scrolling_preserves_mouse_diagram() {
+        let surface = ImageSurface::create(Format::ARgb32, 1280, 720).unwrap();
+        let context = Context::new(&surface).unwrap();
+        let mut state = fixture_state(KeyboardLayout::Tkl, false, true);
+        for i in 0..100 {
+            state.snapshot.bindings.push(Binding {
+                modifiers: Modifiers::SUPER,
+                key: "MOUSE_LEFT".into(),
+                action: format!("Action {i:03}"),
+            });
+        }
+        draw_overlay(&context, 1280.0, 720.0, &mut state);
+        let mouse = state.metrics.mouse;
+        state.metrics.pointer = Some((mouse.x + 10.0, mouse.y + 10.0));
+        assert!(!state.metrics.scroll(100000.0));
+        assert_eq!(state.metrics.touchpad.offset, 0.0);
+        let pad = state.metrics.touchpad.rect;
+        state.metrics.pointer = Some((pad.x + 10.0, pad.y + 10.0));
+        state.metrics.scroll(100000.0);
+        draw_overlay(&context, 1280.0, 720.0, &mut state);
+        assert!(
+            state
+                .metrics
+                .rows
+                .iter()
+                .any(|(_, text)| text.contains("Two-finger scrolling"))
+        );
+        state.modifiers = Modifiers::ALT;
+        let before = state.metrics.touchpad.offset;
+        draw_overlay(&context, 1280.0, 720.0, &mut state);
+        assert_eq!(state.metrics.touchpad.offset, before);
+        state.metrics.scroll(-100000.0);
+        assert_eq!(state.metrics.touchpad.offset, 0.0);
+    }
+
+    #[test]
+    fn render_panel_fixtures() {
+        // Set KEYWRLD_RENDER_DIR to retain the Cairo previews for visual QA.
+        let directory = std::env::var_os("KEYWRLD_RENDER_DIR").map(std::path::PathBuf::from);
+        if let Some(path) = &directory {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        for (name, layout, width, height, left, touch) in [
+            ("full", KeyboardLayout::Full, 1920, 1080, false, true),
+            ("tkl-left", KeyboardLayout::Tkl, 1920, 1080, true, true),
+            ("75", KeyboardLayout::Compact75, 1280, 720, false, true),
+            ("65", KeyboardLayout::Compact65, 1280, 720, true, true),
+            (
+                "60-small",
+                KeyboardLayout::Compact60,
+                1024,
+                600,
+                false,
+                true,
+            ),
+            ("mouse-only", KeyboardLayout::Tkl, 1920, 1080, false, false),
+        ] {
+            let surface = ImageSurface::create(Format::ARgb32, width, height).unwrap();
+            let context = Context::new(&surface).unwrap();
+            let mut state = fixture_state(layout, left, touch);
+            draw_overlay(&context, width as f64, height as f64, &mut state);
+            assert_eq!(state.metrics.panels.len(), if touch { 3 } else { 2 });
+            if name == "mouse-only" {
+                for (label, modifiers) in [
+                    ("none", Modifiers::default()),
+                    ("super-alt", Modifiers::SUPER.with(Modifiers::ALT)),
+                    ("hover-wheel", Modifiers::SUPER),
+                ] {
+                    state.modifiers = modifiers;
+                    state.hovered = (label == "hover-wheel").then(|| "MOUSE_UP".into());
+                    draw_overlay(&context, width as f64, height as f64, &mut state);
+                    if let Some(path) = &directory {
+                        surface
+                            .write_to_png(
+                                &mut std::fs::File::create(path.join(format!("mouse-{label}.png")))
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                    }
+                }
+                state.hovered = None;
+                state.modifiers = Modifiers::SUPER;
+                draw_overlay(&context, width as f64, height as f64, &mut state);
+            }
+            if let Some(path) = &directory {
+                surface
+                    .write_to_png(
+                        &mut std::fs::File::create(path.join(format!("{name}.png"))).unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+    #[test]
+    #[ignore = "requires a live Hyprland session; writes a preview under target"]
+    fn render_live_devices() {
+        let snapshot = load_runtime(None);
+        assert!(
+            snapshot.binding_error.is_none(),
+            "{:?}",
+            snapshot.binding_error
+        );
+        println!(
+            "{} mouse devices, {} touchpads, left placement: {}, gesture discovery: {:?}",
+            snapshot.pointing.mice.len(),
+            snapshot.pointing.touchpads.len(),
+            snapshot.pointing.mouse_left,
+            snapshot.pointing.gestures.status
+        );
+        let mut state = fixture_state(snapshot.layout, false, false);
+        state.snapshot = snapshot;
+        let surface = ImageSurface::create(Format::ARgb32, 1920, 1080).unwrap();
+        let context = Context::new(&surface).unwrap();
         draw_overlay(&context, 1920.0, 1080.0, &mut state);
-        assert_eq!(state.metrics.panel, super_panel);
+        surface
+            .write_to_png(&mut std::fs::File::create("target/keywrld-live.png").unwrap())
+            .unwrap();
     }
 }

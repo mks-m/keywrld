@@ -81,12 +81,12 @@ impl Modifiers {
         parts.join(" + ")
     }
 
-    fn from_words(words: &str) -> Self {
+    pub(crate) fn from_words(words: &str) -> Self {
         words
             .split_whitespace()
             .fold(Self::default(), |mods, word| {
                 match word.to_ascii_uppercase().as_str() {
-                    "SUPER" | "META" => mods.with(Self::SUPER),
+                    "SUPER" | "META" | "MOD4" => mods.with(Self::SUPER),
                     "SHIFT" => mods.with(Self::SHIFT),
                     "CTRL" | "CONTROL" => mods.with(Self::CTRL),
                     "ALT" | "MOD1" => mods.with(Self::ALT),
@@ -144,6 +144,11 @@ pub fn actions_for(bindings: &[Binding], modifiers: Modifiers) -> BTreeMap<Strin
 }
 
 pub fn normalize_key(key: &str) -> String {
+    // Supplemented bindings already carry canonical IDs. In Hyprland's raw
+    // spelling, lowercase mouse_left/mouse_right mean horizontal scrolling.
+    if is_mouse_key(key) {
+        return key.to_string();
+    }
     let compact = key.trim().replace(['_', '-'], " ");
     match compact.to_ascii_uppercase().as_str() {
         "ESC" | "ESCAPE" => "ESCAPE".into(),
@@ -164,6 +169,8 @@ pub fn normalize_key(key: &str) -> String {
         "SEMICOLON" => "SEMICOLON".into(),
         "APOSTROPHE" | "QUOTE" => "APOSTROPHE".into(),
         "GRAVE" | "GRAVE ACCENT" => "GRAVE".into(),
+        "MOUSE LEFT" => "MOUSE_SCROLL_LEFT".into(),
+        "MOUSE RIGHT" => "MOUSE_SCROLL_RIGHT".into(),
         "MOUSE DOWN" => "MOUSE_DOWN".into(),
         "MOUSE UP" => "MOUSE_UP".into(),
         "MOUSE:272" | "LEFT MOUSE BUTTON" => "MOUSE_LEFT".into(),
@@ -191,7 +198,7 @@ pub fn normalize_key(key: &str) -> String {
 pub fn is_mouse_key(key: &str) -> bool {
     matches!(
         key,
-        "MOUSE_DOWN" | "MOUSE_UP" | "MOUSE_LEFT" | "MOUSE_RIGHT" | "MOUSE_MIDDLE"
+        "MOUSE_DOWN" | "MOUSE_UP" | "MOUSE_LEFT" | "MOUSE_RIGHT" | "MOUSE_MIDDLE" | "MOUSE_SCROLL_LEFT" | "MOUSE_SCROLL_RIGHT"
     ) || key.starts_with("MOUSE:")
 }
 
@@ -721,6 +728,10 @@ mod tests {
         assert_eq!(normalize_key("mouse:272"), "MOUSE_LEFT");
         assert_eq!(normalize_key("code:10"), "1");
         assert!(is_mouse_key("MOUSE_UP"));
+        assert_eq!(normalize_key("mouse_left"), "MOUSE_SCROLL_LEFT");
+        assert_eq!(normalize_key("mouse_right"), "MOUSE_SCROLL_RIGHT");
+        assert_eq!(normalize_key(&normalize_key("mouse:272")), "MOUSE_LEFT");
+        assert_eq!(normalize_key(&normalize_key("mouse_left")), "MOUSE_SCROLL_LEFT");
         assert!(!is_mouse_key("UP"));
     }
 
