@@ -28,6 +28,7 @@ struct RenderMetrics {
     panel: Rect,
     panels: Vec<Rect>,
     mouse: Rect,
+    search: ScrollMetrics,
     touchpad: ScrollMetrics,
     pointer: Option<(f64, f64)>,
     rows: Vec<(Rect, String)>,
@@ -50,10 +51,11 @@ impl RenderMetrics {
         let Some((x, y)) = self.pointer else {
             return false;
         };
-        let area = &mut self.touchpad;
-        if area.rect.width > 0.0 && area.rect.contains(x, y) {
-            area.offset = (area.offset + delta * 40.0).clamp(0.0, area.maximum);
-            return true;
+        for area in [&mut self.search, &mut self.touchpad] {
+            if area.rect.width > 0.0 && area.rect.contains(x, y) {
+                area.offset = (area.offset + delta * 40.0).clamp(0.0, area.maximum);
+                return true;
+            }
         }
         false
     }
@@ -65,6 +67,7 @@ struct OverlayState {
     latched_modifiers: Modifiers,
     held_modifiers: Modifiers,
     modifiers: Modifiers,
+    query: String,
     hovered: Option<String>,
     metrics: RenderMetrics,
 }
@@ -144,7 +147,25 @@ fn build_window(
     select_monitor(&window, snapshot.monitor_connector.as_deref());
 
     let provider = gtk::CssProvider::new();
-    provider.load_from_data("window.keywrld-overlay { background: transparent; }");
+    let css_color = |color: Color| {
+        format!(
+            "rgb({:.0}, {:.0}, {:.0})",
+            color.red * 255.0,
+            color.green * 255.0,
+            color.blue * 255.0
+        )
+    };
+    provider.load_from_data(&format!(
+        "window.keywrld-overlay {{ background: transparent; }}
+         entry.shortcut-search {{ background: {}; color: {}; border: 1px solid {};
+             border-radius: 7px; padding: 5px 9px; min-height: 0; min-width: 0;
+             font-size: 12px; box-shadow: none; }}
+         entry.shortcut-search:focus-within {{ border-color: {}; }}",
+        css_color(snapshot.palette.darker_background),
+        css_color(snapshot.palette.foreground),
+        css_color(snapshot.palette.muted),
+        css_color(snapshot.palette.accent),
+    ));
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
@@ -159,6 +180,7 @@ fn build_window(
         latched_modifiers: Modifiers::default(),
         held_modifiers: Modifiers::default(),
         modifiers: Modifiers::default(),
+        query: String::new(),
         hovered: None,
         metrics: RenderMetrics::default(),
     }));
@@ -166,7 +188,7 @@ fn build_window(
     let drawing_area = gtk::DrawingArea::builder()
         .hexpand(true)
         .vexpand(true)
-        .focusable(true)
+        .focusable(false)
         .build();
     drawing_area.set_draw_func({
         let state = state.clone();
@@ -320,8 +342,49 @@ fn build_window(
     });
     window.add_controller(keys);
 
-    window.set_child(Some(&drawing_area));
-    gtk::prelude::GtkWindowExt::set_focus(&window, Some(&drawing_area));
+    let search = gtk::Entry::builder()
+        .placeholder_text("Search shortcuts…")
+        .width_chars(1)
+        .secondary_icon_name("edit-clear-symbolic")
+        .build();
+    search.add_css_class("shortcut-search");
+    search.set_icon_tooltip_text(gtk::EntryIconPosition::Secondary, Some("Clear search"));
+    search.connect_icon_release(|entry, position| {
+        if position == gtk::EntryIconPosition::Secondary {
+            entry.set_text("");
+            entry.grab_focus();
+        }
+    });
+    search.connect_changed({
+        let state = state.clone();
+        let drawing_area = drawing_area.clone();
+        move |entry| {
+            let mut state = state.borrow_mut();
+            state.query = entry.text().to_string();
+            state.metrics.search.offset = 0.0;
+            drawing_area.set_tooltip_text(None);
+            drawing_area.queue_draw();
+        }
+    });
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&drawing_area));
+    overlay.add_overlay(&search);
+    overlay.connect_get_child_position({
+        let state = state.clone();
+        move |overlay, _| {
+            let state = state.borrow();
+            let layout = overlay_layout(overlay.width() as f64, overlay.height() as f64, &state);
+            let rect = search_entry_rect(layout.search);
+            Some(gdk::Rectangle::new(
+                rect.x.round() as i32,
+                rect.y.round() as i32,
+                rect.width.round() as i32,
+                rect.height.round() as i32,
+            ))
+        }
+    });
+    window.set_child(Some(&overlay));
+    gtk::prelude::GtkWindowExt::set_focus(&window, Some(&search));
     window
 }
 
@@ -400,6 +463,7 @@ fn update_held_modifiers(
     if state.modifiers != modifiers || state.held_modifiers != held_modifiers {
         state.held_modifiers = held_modifiers;
         state.modifiers = modifiers;
+        state.metrics.search.offset = 0.0;
         state.hovered = None;
         drawing_area.set_tooltip_text(None);
         drawing_area.queue_draw();
@@ -414,6 +478,7 @@ fn toggle_latched_modifier(
     let mut state = state.borrow_mut();
     state.latched_modifiers = state.latched_modifiers.toggled(modifier);
     state.modifiers = state.latched_modifiers.with(state.held_modifiers);
+    state.metrics.search.offset = 0.0;
     state.hovered = None;
     drawing_area.set_tooltip_text(None);
     drawing_area.queue_draw();
@@ -425,11 +490,6 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
     let _ = context.paint();
 
     let actions = actions_for(&state.snapshot.bindings, state.modifiers);
-    let geometry_ids = state.geometry.key_ids();
-    let overflow: Vec<_> = actions
-        .iter()
-        .filter(|(key, _)| !geometry_ids.contains(key.as_str()) && !is_mouse_key(key))
-        .collect();
     // Keep the diagram geometry stable while only its actions follow modifiers.
     let mouse_keys: BTreeSet<_> = state
         .snapshot
@@ -442,35 +502,18 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
     let outer_padding = 24.0;
     let header_height = 82.0;
     let detail_height = 66.0;
-    let chip_height = 46.0;
-    let chip_gap = 8.0;
-    let chip_columns = usize::min(4, usize::max(1, overflow.len()));
-    let chip_rows = overflow.len().div_ceil(chip_columns);
-    let overflow_height = if chip_rows == 0 {
-        0.0
-    } else {
-        chip_rows as f64 * chip_height + 12.0
-    };
     let touch_rows = if state.snapshot.pointing.touchpads.is_empty() {
         Vec::new()
     } else {
         touchpad_rows(&state.snapshot.pointing, &state.snapshot.bindings)
     };
-    let layout = panel_layout(
-        width,
-        height,
-        &state.geometry,
-        overflow_height,
-        !mouse_keys.is_empty() || !state.snapshot.pointing.mice.is_empty(),
-        touch_rows.len(),
-        state.snapshot.pointing.mouse_left,
-    );
+    let layout = overlay_layout(width, height, state);
     let panel = layout.keyboard;
     let unit = layout.unit;
     let board_width = state.geometry.width * unit;
     let board_height = state.geometry.height * unit;
     state.metrics.panel = panel;
-    state.metrics.panels = vec![panel];
+    state.metrics.panels = vec![panel, layout.search];
     state.metrics.panels.extend(layout.mouse);
     state.metrics.panels.extend(layout.touchpad);
     state.metrics.hits.clear();
@@ -524,38 +567,7 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
         });
     }
 
-    let overflow_y = board_y + board_height + 12.0;
-    if !overflow.is_empty() {
-        let chip_width = (board_width - chip_gap * (chip_columns.saturating_sub(1)) as f64)
-            / chip_columns as f64;
-        for (index, (key, key_actions)) in overflow.iter().enumerate() {
-            let column = index % chip_columns;
-            let row = index / chip_columns;
-            let rect = Rect {
-                x: content_x + column as f64 * (chip_width + chip_gap),
-                y: overflow_y + row as f64 * chip_height,
-                width: chip_width,
-                height: chip_height - chip_gap,
-            };
-            let hovered = state.hovered.as_deref() == Some(key.as_str());
-            with_icon_atlas(|icon_atlas| {
-                draw_overflow_chip(
-                    context,
-                    rect,
-                    key,
-                    key_actions,
-                    hovered,
-                    icon_atlas,
-                    palette,
-                );
-            });
-            state.metrics.hits.push(HitRegion {
-                rect,
-                key: (*key).clone(),
-                legend: friendly_key_name(key),
-            });
-        }
-    }
+    draw_search_panel(context, layout.search, state);
 
     if let Some(panel) = layout.mouse {
         state.metrics.mouse = panel;
@@ -564,7 +576,7 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
         state.metrics.mouse = Rect::default();
     }
 
-    let detail_y = board_y + board_height + overflow_height + 10.0;
+    let detail_y = board_y + board_height + 10.0;
     draw_details(
         context,
         state,
@@ -596,16 +608,195 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
 
 struct PanelLayout {
     keyboard: Rect,
+    search: Rect,
     mouse: Option<Rect>,
     touchpad: Option<Rect>,
     unit: f64,
+}
+
+fn overlay_layout(width: f64, height: f64, state: &OverlayState) -> PanelLayout {
+    let show_mouse = !state.snapshot.pointing.mice.is_empty()
+        || state
+            .snapshot
+            .bindings
+            .iter()
+            .any(|binding| is_mouse_key(&binding.key));
+    let touch_count = if state.snapshot.pointing.touchpads.is_empty() {
+        0
+    } else {
+        touchpad_rows(&state.snapshot.pointing, &state.snapshot.bindings).len()
+    };
+    panel_layout(
+        width,
+        height,
+        &state.geometry,
+        show_mouse,
+        touch_count,
+        state.snapshot.pointing.mouse_left,
+    )
+}
+
+fn search_entry_rect(panel: Rect) -> Rect {
+    Rect {
+        x: panel.x + 12.0,
+        y: panel.y + 42.0,
+        width: panel.width - 24.0,
+        height: 36.0,
+    }
+}
+
+// Compare exact, contiguous, then scattered matches. Character offsets keep
+// ranking consistent for Unicode descriptions as well as ASCII key names.
+fn fuzzy_token_score(field: &str, token: &str) -> Option<(usize, usize, usize)> {
+    if field == token {
+        return Some((0, 0, 0));
+    }
+    if let Some(start) = field.find(token) {
+        return Some((0, 1, field[..start].chars().count()));
+    }
+    let mut wanted = token.chars();
+    let mut next = wanted.next()?;
+    for (index, character) in field.chars().enumerate() {
+        if character == next {
+            match wanted.next() {
+                Some(character) => next = character,
+                None => return Some((1, 1, index + 1 - token.chars().count())),
+            }
+        }
+    }
+    None
+}
+
+fn shortcut_rows(
+    bindings: &[crate::core::Binding],
+    modifiers: Modifiers,
+    query: &str,
+) -> Vec<PeripheralRow> {
+    let tokens: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut seen = BTreeSet::new();
+    let mut matches = Vec::new();
+    for binding in bindings {
+        if (!modifiers.is_empty() && binding.modifiers != modifiers)
+            || !seen.insert((binding.modifiers, &binding.key, &binding.action))
+        {
+            continue;
+        }
+        let label = chord_label(binding.modifiers, &friendly_key_name(&binding.key));
+        let fields = [
+            binding.action.to_lowercase(),
+            binding.key.to_lowercase(),
+            label.to_lowercase(),
+        ];
+        let score = tokens.iter().try_fold((0, 0, 0), |total, token| {
+            fields
+                .iter()
+                .filter_map(|field| fuzzy_token_score(field, token))
+                .min()
+                .map(|score| (total.0 + score.0, total.1 + score.1, total.2 + score.2))
+        });
+        if let Some(score) = score {
+            matches.push((score, label, binding.action.clone()));
+        }
+    }
+    matches.sort();
+    matches
+        .into_iter()
+        .map(|(_, label, action)| PeripheralRow { label, action })
+        .collect()
+}
+
+fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
+    let palette = state.snapshot.palette;
+    rounded_rectangle(context, panel, 16.0);
+    set_source(context, palette.background.with_alpha(0.985));
+    let _ = context.fill_preserve();
+    context.set_line_width(1.0);
+    set_source(context, palette.muted.with_alpha(0.9));
+    let _ = context.stroke();
+    draw_text(
+        context,
+        panel.x + 18.0,
+        panel.y + 29.0,
+        "SHORTCUTS",
+        15.0,
+        FontWeight::Bold,
+        palette.foreground,
+    );
+
+    // The native entry covers this fallback in the live window. Keeping the
+    // field in Cairo also makes standalone panel previews representative.
+    let entry = search_entry_rect(panel);
+    rounded_rectangle(context, entry, 7.0);
+    set_source(context, palette.darker_background);
+    let _ = context.fill_preserve();
+    set_source(context, palette.accent);
+    let _ = context.stroke();
+    draw_text(
+        context,
+        entry.x + 10.0,
+        entry.y + 23.0,
+        &elide(
+            if state.query.is_empty() {
+                "Search shortcuts…"
+            } else {
+                &state.query
+            },
+            ((entry.width - 24.0) / 7.0) as usize,
+        ),
+        12.0,
+        FontWeight::Normal,
+        palette.foreground,
+    );
+
+    let rows = shortcut_rows(&state.snapshot.bindings, state.modifiers, &state.query);
+    let filter = if state.modifiers.is_empty() {
+        "All modifiers".into()
+    } else {
+        state.modifiers.label()
+    };
+    let noun = if rows.len() == 1 { "result" } else { "results" };
+    let subtitle = format!("{} {noun} · {filter}", rows.len());
+    draw_text(
+        context,
+        panel.x + 18.0,
+        panel.y + 99.0,
+        &elide(&subtitle, ((panel.width - 36.0) / 6.0) as usize),
+        11.0,
+        FontWeight::Normal,
+        palette.dark_foreground,
+    );
+    let viewport = Rect {
+        x: panel.x + 12.0,
+        y: panel.y + 112.0,
+        width: panel.width - 24.0,
+        height: (panel.height - 124.0).max(0.0),
+    };
+    if rows.is_empty() {
+        draw_text(
+            context,
+            viewport.x + 10.0,
+            viewport.y + 24.0,
+            "No matching shortcuts",
+            12.0,
+            FontWeight::Normal,
+            palette.dark_foreground,
+        );
+    }
+    state.metrics.search.rect = viewport;
+    draw_scroll_rows(
+        context,
+        viewport,
+        &rows,
+        &mut state.metrics.search,
+        &mut state.metrics.rows,
+        palette,
+    );
 }
 
 fn panel_layout(
     width: f64,
     height: f64,
     geometry: &KeyboardGeometry,
-    overflow: f64,
     show_mouse: bool,
     touch_rows: usize,
     left: bool,
@@ -618,7 +809,10 @@ fn panel_layout(
     } else {
         (width * 0.22).clamp(210.0, 310.0).min(width * 0.35)
     };
-    let side = if !show_mouse { 0.0 } else { mouse_width + gap };
+    let mouse_side = if !show_mouse { 0.0 } else { mouse_width + gap };
+    let search_width = (width * 0.23).clamp(230.0, 340.0).min(width * 0.30);
+    let search_side = search_width + gap;
+    let side = search_side + mouse_side;
     let touch_height = if touch_rows == 0 {
         0.0
     } else {
@@ -629,7 +823,7 @@ fn panel_layout(
     } else {
         touch_height + gap
     };
-    let chrome = 82.0 + 66.0 + 48.0 + overflow;
+    let chrome = 82.0 + 66.0 + 48.0;
     let unit = ((width - 2.0 * margin - side - 48.0) / geometry.width)
         .min((available_height - below - chrome) / geometry.height)
         .clamp(1.0, 78.0);
@@ -637,7 +831,7 @@ fn panel_layout(
     let keyboard_height = geometry.height * unit + chrome;
     let x = (width - keyboard_width - side) / 2.0;
     let keyboard = Rect {
-        x: x + if left { side } else { 0.0 },
+        x: x + search_side + if left { mouse_side } else { 0.0 },
         y: (height - keyboard_height - below) / 2.0,
         width: keyboard_width,
         height: keyboard_height,
@@ -646,7 +840,7 @@ fn panel_layout(
         let panel_height = 450.0_f64.min(keyboard_height);
         Rect {
             x: if left {
-                x
+                x + search_side
             } else {
                 keyboard.x + keyboard.width + gap
             },
@@ -664,6 +858,12 @@ fn panel_layout(
     });
     PanelLayout {
         keyboard,
+        search: Rect {
+            x,
+            y: keyboard.y,
+            width: search_width,
+            height: keyboard.height,
+        },
         mouse,
         touchpad,
         unit,
@@ -1022,6 +1222,17 @@ fn draw_peripheral_panel(
         height: (panel.height - 72.0).max(0.0),
     };
     scroll.rect = panel;
+    draw_scroll_rows(context, viewport, rows, scroll, row_hits, palette);
+}
+
+fn draw_scroll_rows(
+    context: &Context,
+    viewport: Rect,
+    rows: &[PeripheralRow],
+    scroll: &mut ScrollMetrics,
+    row_hits: &mut Vec<(Rect, String)>,
+    palette: Palette,
+) {
     scroll.maximum = (rows.len() as f64 * 48.0 - viewport.height).max(0.0);
     scroll.offset = scroll.offset.clamp(0.0, scroll.maximum);
     let _ = context.save();
@@ -1094,24 +1305,31 @@ fn draw_header(
     width: f64,
     palette: Palette,
 ) {
+    let title = if state.modifiers.is_empty() {
+        "NO MODIFIERS".to_string()
+    } else {
+        state.modifiers.label()
+    };
     draw_text(
         context,
         x,
         y + 24.0,
-        &if state.modifiers.is_empty() {
-            "NO MODIFIERS".to_string()
-        } else {
-            state.modifiers.label()
-        },
+        &elide_to_width(context, &title, width, 22.0, FontWeight::Bold),
         22.0,
         FontWeight::Bold,
         palette.foreground,
     );
-    draw_text_right(
+    draw_text(
         context,
-        x + width,
-        y + 22.0,
-        &state.snapshot.device_name,
+        x,
+        y + 44.0,
+        &elide_to_width(
+            context,
+            &state.snapshot.device_name,
+            width,
+            13.0,
+            FontWeight::Normal,
+        ),
         13.0,
         FontWeight::Normal,
         palette.dark_foreground,
@@ -1124,8 +1342,8 @@ fn draw_header(
     draw_text(
         context,
         x,
-        y + 53.0,
-        &elide(message, 112),
+        y + 64.0,
+        &elide_to_width(context, message, width, 13.0, FontWeight::Normal),
         13.0,
         FontWeight::Normal,
         if state.snapshot.binding_error.is_some() {
@@ -1175,6 +1393,22 @@ fn draw_key(
     } else {
         palette.dark_foreground.with_alpha(0.66)
     };
+    // Small full-size boards show fitted legends; actions remain available
+    // in the details strip and searchable list.
+    if rect.height < 24.0 {
+        let size = (rect.height * 0.4).clamp(5.0, 8.0);
+        let legend = elide_to_width(context, legend, rect.width - 4.0, size, FontWeight::Bold);
+        draw_text_centered(
+            context,
+            rect.x + rect.width / 2.0,
+            rect.y + (rect.height + size) / 2.0 - 1.0,
+            &legend,
+            size,
+            FontWeight::Bold,
+            legend_color,
+        );
+        return;
+    }
     draw_text(
         context,
         rect.x + 7.0,
@@ -1219,71 +1453,6 @@ fn draw_key(
                 );
             }
         }
-    }
-}
-
-fn draw_overflow_chip(
-    context: &Context,
-    rect: Rect,
-    key: &str,
-    actions: &[String],
-    hovered: bool,
-    icon_atlas: Option<&IconAtlas>,
-    palette: Palette,
-) {
-    rounded_rectangle(context, rect, 7.0);
-    set_source(
-        context,
-        if hovered {
-            palette.accent.with_alpha(0.28)
-        } else {
-            palette.selection
-        },
-    );
-    let _ = context.fill_preserve();
-    context.set_line_width(if hovered { 2.0 } else { 1.0 });
-    set_source(
-        context,
-        if hovered {
-            palette.accent
-        } else {
-            palette.muted
-        },
-    );
-    let _ = context.stroke();
-    draw_text(
-        context,
-        rect.x + 9.0,
-        rect.y + 15.0,
-        &friendly_key_name(key),
-        10.0,
-        FontWeight::Bold,
-        palette.accent,
-    );
-    let icons = icons_for_actions(actions);
-    if let (Some(atlas), Some(icons)) = (icon_atlas, icons) {
-        draw_action_icons(
-            context,
-            atlas,
-            Rect {
-                x: rect.x + 8.0,
-                y: rect.y + 16.0,
-                width: rect.width - 16.0,
-                height: rect.height - 17.0,
-            },
-            &icons,
-            palette.foreground,
-        );
-    } else {
-        draw_text(
-            context,
-            rect.x + 9.0,
-            rect.y + 31.0,
-            &elide(&actions.join(" · "), ((rect.width - 18.0) / 6.0) as usize),
-            10.0,
-            FontWeight::Normal,
-            palette.foreground,
-        );
     }
 }
 
@@ -1345,7 +1514,7 @@ fn draw_details(
                 context,
                 rect.x + 14.0,
                 rect.y + 21.0,
-                &chord,
+                &elide_to_width(context, &chord, rect.width - 28.0, 12.0, FontWeight::Bold),
                 12.0,
                 FontWeight::Bold,
                 palette.accent,
@@ -1354,9 +1523,12 @@ fn draw_details(
                 context,
                 rect.x + 14.0,
                 rect.y + 42.0,
-                &elide(
+                &elide_to_width(
+                    context,
                     &key_actions.join("  •  "),
-                    ((rect.width - 28.0) / 7.0) as usize,
+                    rect.width - 28.0,
+                    14.0,
+                    FontWeight::Normal,
                 ),
                 14.0,
                 FontWeight::Normal,
@@ -1368,9 +1540,15 @@ fn draw_details(
                 context,
                 rect.x + 14.0,
                 rect.y + 33.0,
-                &format!(
-                    "{}  ·  No binding",
-                    chord_label(state.modifiers, &hit.legend)
+                &elide_to_width(
+                    context,
+                    &format!(
+                        "{}  ·  No binding",
+                        chord_label(state.modifiers, &hit.legend)
+                    ),
+                    rect.width - 28.0,
+                    13.0,
+                    FontWeight::Normal,
                 ),
                 13.0,
                 FontWeight::Normal,
@@ -1381,16 +1559,22 @@ fn draw_details(
             draw_text(
                 context,
                 rect.x + 14.0,
-                rect.y + 33.0,
-                "Hover a key or mouse control for its shortcut and action",
+                rect.y + 21.0,
+                &elide_to_width(
+                    context,
+                    "Hover a key or mouse control for details",
+                    rect.width - 28.0,
+                    13.0,
+                    FontWeight::Normal,
+                ),
                 13.0,
                 FontWeight::Normal,
                 palette.dark_foreground,
             );
-            draw_text_right(
+            draw_text(
                 context,
-                rect.x + rect.width - 14.0,
-                rect.y + 33.0,
+                rect.x + 14.0,
+                rect.y + 42.0,
                 "Esc or backdrop to close",
                 12.0,
                 FontWeight::Normal,
@@ -1421,6 +1605,8 @@ fn modifier_for_key_id(key: &str) -> Option<Modifiers> {
 
 fn friendly_key_name(key: &str) -> String {
     match key {
+        "RETURN" => "Enter".into(),
+        "ESCAPE" => "Esc".into(),
         "MOUSE_SCROLL_LEFT" => "Wheel left".into(),
         "MOUSE_SCROLL_RIGHT" => "Wheel right".into(),
         "MOUSE_DOWN" => "Wheel down".into(),
@@ -1516,6 +1702,33 @@ fn set_source(context: &Context, color: Color) {
     context.set_source_rgba(color.red, color.green, color.blue, color.alpha);
 }
 
+fn elide_to_width(
+    context: &Context,
+    text: &str,
+    width: f64,
+    size: f64,
+    weight: FontWeight,
+) -> String {
+    context.select_font_face("sans", FontSlant::Normal, weight);
+    context.set_font_size(size);
+    let fits = |text: &str| {
+        context
+            .text_extents(text)
+            .is_ok_and(|extent| extent.x_advance() <= width)
+    };
+    if fits(text) {
+        return text.into();
+    }
+    let mut shortened = text.to_string();
+    while shortened.pop().is_some() {
+        let candidate = format!("{shortened}…");
+        if fits(&candidate) {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
 fn draw_text(
     context: &Context,
     x: f64,
@@ -1558,37 +1771,149 @@ fn draw_text_centered(
     );
 }
 
-fn draw_text_right(
-    context: &Context,
-    right_x: f64,
-    baseline_y: f64,
-    text: &str,
-    size: f64,
-    weight: FontWeight,
-    color: Color,
-) {
-    context.select_font_face("sans", FontSlant::Normal, weight);
-    context.set_font_size(size);
-    let width = context
-        .text_extents(text)
-        .map(|extents| extents.width())
-        .unwrap_or(0.0);
-    draw_text(
-        context,
-        right_x - width,
-        baseline_y,
-        text,
-        size,
-        weight,
-        color,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::Binding;
     use gtk::cairo::{Format, ImageSurface};
+
+    #[test]
+    fn search_initially_includes_all_binding_kinds_and_deduplicates() {
+        let bindings = crate::core::parse_bindings(
+            "SUPER + RETURN → Terminal\nALT + RETURN → Other terminal\nSUPER + XF86AudioMute → Mute\nSUPER + mouse:272 → Move window\nA → Plain action\nSUPER + RETURN → Terminal\nSUPER + RETURN → Second action",
+        );
+        let rows = shortcut_rows(&bindings, Modifiers::default(), "");
+        assert_eq!(rows.len(), 6);
+        for description in [
+            "Terminal",
+            "Other terminal",
+            "Mute",
+            "Move window",
+            "Plain action",
+            "Second action",
+        ] {
+            assert!(rows.iter().any(|row| row.action == description));
+        }
+        assert_eq!(rows, shortcut_rows(&bindings, Modifiers::default(), "   "));
+        let mut reversed = bindings.clone();
+        reversed.reverse();
+        assert_eq!(rows, shortcut_rows(&reversed, Modifiers::default(), ""));
+        assert_eq!(
+            rows.iter().filter(|row| row.action == "Terminal").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_combines_exact_modifier_filter_with_fuzzy_tokens() {
+        let bindings = crate::core::parse_bindings(
+            "SUPER + RETURN → Open terminal\nSUPER SHIFT + RETURN → Open terminal split\nALT + RETURN → Open terminal alternate\nA → Unmodified terminal\nSUPER + mouse:272 → Move window\nSUPER + XF86AudioMute → Silence sound",
+        );
+        assert_eq!(shortcut_rows(&bindings, Modifiers::SUPER, "trm").len(), 1);
+        assert_eq!(
+            shortcut_rows(&bindings, Modifiers::SUPER.with(Modifiers::SHIFT), "trm")[0].action,
+            "Open terminal split"
+        );
+        assert_eq!(
+            shortcut_rows(&bindings, Modifiers::default(), "trm").len(),
+            4
+        );
+        for query in ["RETURN", "EnTeR", "sup trm", "super return term"] {
+            assert_eq!(
+                shortcut_rows(&bindings, Modifiers::SUPER, query)[0].action,
+                "Open terminal"
+            );
+        }
+        for query in ["mouse_left", "left click", "mv wnd"] {
+            assert_eq!(
+                shortcut_rows(&bindings, Modifiers::default(), query)[0].action,
+                "Move window"
+            );
+        }
+        assert_eq!(
+            shortcut_rows(&bindings, Modifiers::default(), "audiomute")[0].action,
+            "Silence sound"
+        );
+        assert!(shortcut_rows(&bindings, Modifiers::CTRL, "").is_empty());
+        assert!(shortcut_rows(&bindings, Modifiers::default(), "zzzz").is_empty());
+        assert!(shortcut_rows(&bindings, Modifiers::SUPER, "term nonexistent").is_empty());
+    }
+
+    #[test]
+    fn search_ranks_exact_then_contiguous_then_scattered_matches() {
+        let bindings = crate::core::parse_bindings(
+            "SUPER + A → Terminal\nSUPER + B → Open term\nSUPER + C → Term\nSUPER + D → The emergency room\nSUPER + E → Term\nSUPER + F → Über öffnen",
+        );
+        let rows = shortcut_rows(&bindings, Modifiers::default(), "term");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.action.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Term",
+                "Term",
+                "Terminal",
+                "Open term",
+                "The emergency room"
+            ]
+        );
+        assert!(rows[0].label < rows[1].label);
+        assert_eq!(
+            shortcut_rows(&bindings, Modifiers::default(), "ÜBR ÖFN")[0].action,
+            "Über öffnen"
+        );
+    }
+
+    #[test]
+    fn search_scrolls_independently_and_filtering_keeps_panels_stable() {
+        let surface = ImageSurface::create(Format::ARgb32, 1280, 720).unwrap();
+        let context = Context::new(&surface).unwrap();
+        let mut state = fixture_state(KeyboardLayout::Tkl, true, true);
+        for index in 0..100 {
+            state.snapshot.bindings.push(Binding {
+                modifiers: Modifiers::SUPER,
+                key: "F24".into(),
+                action: format!("Extra action {index:03}"),
+            });
+        }
+        draw_overlay(&context, 1280.0, 720.0, &mut state);
+        let panels = state.metrics.panels.clone();
+        let search = state.metrics.search.rect;
+        state.metrics.pointer = Some((search.x + 5.0, search.y + 5.0));
+        assert!(state.metrics.contains_panel(search.x, search.y));
+        assert!(state.metrics.scroll(100000.0));
+        assert_eq!(state.metrics.search.offset, state.metrics.search.maximum);
+        assert!(state.metrics.search.offset > 0.0);
+        assert_eq!(state.metrics.touchpad.offset, 0.0);
+        draw_overlay(&context, 1280.0, 720.0, &mut state);
+        assert!(
+            state
+                .metrics
+                .rows
+                .iter()
+                .filter(|(rect, _)| rect.x == search.x)
+                .all(|(rect, _)| rect.y >= search.y
+                    && rect.y + rect.height <= search.y + search.height)
+        );
+        let before = state.metrics.search.offset;
+        let pad = state.metrics.touchpad.rect;
+        state.metrics.pointer = Some((pad.x + 5.0, pad.y + 5.0));
+        assert!(state.metrics.scroll(100000.0));
+        assert_eq!(state.metrics.search.offset, before);
+        state.query = "no such shortcut".into();
+        state.modifiers = Modifiers::ALT;
+        draw_overlay(&context, 1280.0, 720.0, &mut state);
+        assert_eq!(state.metrics.panels, panels);
+        assert_eq!(state.metrics.search.maximum, 0.0);
+        assert_eq!(state.metrics.search.offset, 0.0);
+        assert!(
+            !state
+                .metrics
+                .rows
+                .iter()
+                .any(|(rect, _)| rect.x == search.x)
+        );
+    }
 
     #[test]
     fn maps_only_the_current_physical_gdk_modifier_state() {
@@ -1803,7 +2128,6 @@ mod tests {
                 1024.0,
                 600.0,
                 &KeyboardGeometry::new(KeyboardLayout::Full),
-                0.0,
                 true,
                 10,
                 left,
@@ -1879,6 +2203,7 @@ mod tests {
             latched_modifiers: Modifiers::default(),
             held_modifiers: Modifiers::SUPER,
             modifiers: Modifiers::SUPER,
+            query: String::new(),
             hovered: None,
             metrics: RenderMetrics::default(),
         }
@@ -1900,12 +2225,11 @@ mod tests {
                             width,
                             height,
                             &KeyboardGeometry::new(keyboard),
-                            58.0,
                             true,
                             touch,
                             left,
                         );
-                        let mut panels = vec![layout.keyboard];
+                        let mut panels = vec![layout.keyboard, layout.search];
                         panels.extend(layout.mouse);
                         panels.extend(layout.touchpad);
                         for panel in &panels {
@@ -1928,6 +2252,12 @@ mod tests {
                         }
                         let mouse = layout.mouse.unwrap();
                         let keyboard = layout.keyboard;
+                        let search = layout.search;
+                        let neighbor = if left { mouse } else { keyboard };
+                        assert!((neighbor.x - search.x - search.width - 24.0).abs() < 0.001);
+                        let entry = search_entry_rect(search);
+                        assert!(search.contains(entry.x, entry.y));
+                        assert!(search.contains(entry.x + entry.width, entry.y + entry.height));
                         assert!(
                             (mouse.y + mouse.height / 2.0 - keyboard.y - keyboard.height / 2.0)
                                 .abs()
@@ -1943,6 +2273,10 @@ mod tests {
                             ..Default::default()
                         };
                         assert!(!metrics.contains_panel(gap_x, mouse.y + mouse.height / 2.0));
+                        assert!(
+                            !metrics
+                                .contains_panel(search.x + search.width + 12.0, search.y + 10.0)
+                        );
                         assert!(metrics.contains_panel(mouse.x + 1.0, mouse.y + 1.0));
                         if let Some(pad) = layout.touchpad {
                             assert!(
@@ -1959,7 +2293,6 @@ mod tests {
             1280.0,
             720.0,
             &KeyboardGeometry::new(KeyboardLayout::Tkl),
-            0.0,
             false,
             0,
             false,
@@ -2024,12 +2357,37 @@ mod tests {
                 true,
             ),
             ("mouse-only", KeyboardLayout::Tkl, 1920, 1080, false, false),
+            (
+                "full-small-left",
+                KeyboardLayout::Full,
+                1024,
+                600,
+                true,
+                true,
+            ),
+            ("search-all", KeyboardLayout::Tkl, 1280, 720, false, false),
+            ("search-query", KeyboardLayout::Tkl, 1280, 720, false, false),
+            ("search-empty", KeyboardLayout::Tkl, 1280, 720, false, false),
         ] {
             let surface = ImageSurface::create(Format::ARgb32, width, height).unwrap();
             let context = Context::new(&surface).unwrap();
             let mut state = fixture_state(layout, left, touch);
+            if name.starts_with("search-") {
+                state.modifiers = Modifiers::default();
+                state.query = match name {
+                    "search-query" => "trm",
+                    "search-empty" => "zzzz",
+                    _ => "",
+                }
+                .into();
+                state.snapshot.bindings.push(Binding {
+                    modifiers: Modifiers::ALT,
+                    key: "F24".into(),
+                    action: "Unmatched shortcut".into(),
+                });
+            }
             draw_overlay(&context, width as f64, height as f64, &mut state);
-            assert_eq!(state.metrics.panels.len(), if touch { 3 } else { 2 });
+            assert_eq!(state.metrics.panels.len(), if touch { 4 } else { 3 });
             if name == "mouse-only" {
                 for (label, modifiers) in [
                     ("none", Modifiers::default()),

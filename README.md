@@ -48,6 +48,21 @@ Device detection prefers an exact USB profile, then model-name hints, then
 input capabilities. `--layout` is available when hardware metadata is
 ambiguous. Escape, a backdrop click, or invoking the app again closes it.
 
+## Shortcut search
+
+The separate left panel initially lists all registered keyboard and mouse
+bindings across every modifier combination, including keys absent from the
+detected layout. Type immediately to fuzzy-search action descriptions, key
+names, and modifier labels. Each word narrows the results; exact and contiguous
+matches appear before scattered matches.
+
+Holding or latching modifiers filters the list to that exact combination.
+Releasing held modifiers and clearing latched modifiers restores all combinations.
+Clear the search field to remove the text filter. Scroll over the results
+independently of the touchpad panel, and hover a row for its full chord and
+description. Results provide shortcut help; clicking them does not run actions.
+The search panel stays outermost left when the mouse diagram is also on the left.
+
 ## Pointing-device panels
 
 Mouse bindings appear on a symbolic mouse in a separate panel, with a 24-pixel

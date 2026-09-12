@@ -358,10 +358,6 @@ impl KeyboardGeometry {
     pub fn new(layout: KeyboardLayout) -> Self {
         build_geometry(layout)
     }
-
-    pub fn key_ids(&self) -> BTreeSet<&str> {
-        self.keys.iter().map(|key| key.id.as_str()).collect()
-    }
 }
 
 fn key(id: &str, legend: &str, x: f64, y: f64, width: f64) -> KeySpec {
