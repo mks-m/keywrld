@@ -50,7 +50,7 @@ ambiguous. Escape, a backdrop click, or invoking the app again closes it.
 
 ## Shortcut search
 
-The separate left panel initially lists all registered keyboard and mouse
+The separate search panel initially lists all registered keyboard and mouse
 bindings across every modifier combination, including keys absent from the
 detected layout. Type immediately to fuzzy-search action descriptions, key
 names, and modifier labels. Each word narrows the results; exact and contiguous
@@ -61,24 +61,44 @@ Releasing held modifiers and clearing latched modifiers restores all combination
 Clear the search field to remove the text filter. Scroll over the results
 independently of the touchpad panel, and hover a row for its full chord and
 description. Results provide shortcut help; clicking them does not run actions.
-The search panel stays outermost left when the mouse diagram is also on the left.
+In landscape layouts, search stays outermost left when the mouse diagram is also on the left.
+
+## Responsive layout
+
+The overlay uses the screen's available size after display scaling. Wide screens
+keep search, keyboard and mouse side by side. When this would shrink keyboard
+units below 32 logical pixels, the keyboard moves above a row of search, touchpad
+and mouse panels, with a shorter header and footer. Search stays outermost left;
+a left-handed mouse moves ahead of the touchpad.
+
+Portrait screens put the keyboard across the top, with search beside a column of
+mouse and touchpad panels below. That lower arrangement is mirrored for a
+left-handed mouse. Missing devices release their space to the remaining panels.
+Layouts adapt on resize while preserving the search and selected modifiers;
+search and touchpad lists continue to scroll independently.
+
+The readability target is 1280×720 landscape and 720×1280 portrait logical pixels
+or larger. Smaller areas receive best-effort fitting. Keyboard diagrams grow up
+to 78 logical pixels per unit; display scaling handles high-density screens.
 
 ## Pointing-device panels
 
-Mouse bindings appear on a symbolic mouse in a separate panel, with a 24-pixel
-gap beside the keyboard. Left/right buttons, wheel click and scroll directions
+Mouse bindings appear on a symbolic mouse in a separate panel, with 24-pixel
+gaps between panels. On wide screens it sits beside the keyboard. Left/right buttons, wheel click and scroll directions
 show action icons (or short text) for the exact selected modifier chord. Hover a
 control for its full chord and actions. Thumb buttons and horizontal scrolling
-appear when configured, and the diagram stays in place when no bindings match. The panel moves to the left when the detected mice agree on
+appear when configured, and the diagram stays in place when no bindings match.
+The panel moves to the left when the detected mice agree on
 left-handed operation. Conflicting or unavailable device settings fall back to
 Hyprland's global `input.left_handed` setting, then to the right.
 
-A detected touchpad adds a centered panel below the keyboard. It lists configured
+A detected touchpad adds a panel, centered below the keyboard on wide screens. It lists configured
 gestures, shared click/scroll bindings, and confirmed tap, clickfinger, button
 mapping and scrolling settings. Devices with identical settings share a controls
 group. The touchpad list keeps all chords visible; scroll over it to see remaining
 rows and hover a row for its complete text. The mouse diagram follows held and
-latched modifiers together with the keyboard. Clicking the backdrop, including the gaps, closes the overlay.
+latched modifiers together with the keyboard. Clicking the backdrop, including
+the gaps, closes the overlay.
 
 Detection refreshes each time the overlay opens. Hyprland's device registry is
 matched to Linux input metadata; touchpads use udev classification with a sysfs

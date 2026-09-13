@@ -192,13 +192,10 @@ fn build_window(
         .build();
     drawing_area.set_draw_func({
         let state = state.clone();
-        move |_, context, width, height| {
-            draw_overlay(
-                context,
-                width as f64,
-                height as f64,
-                &mut state.borrow_mut(),
-            );
+        move |area, context, width, height| {
+            let mut state = state.borrow_mut();
+            draw_overlay(context, width as f64, height as f64, &mut state);
+            area.set_tooltip_text(tooltip_at_pointer(&state).as_deref());
         }
     });
 
@@ -216,27 +213,7 @@ fn build_window(
                 .map(|hit| hit.key.clone());
             let mut state = state.borrow_mut();
             state.metrics.pointer = Some((x, y));
-            let tooltip = state
-                .metrics
-                .hits
-                .iter()
-                .find(|hit| hit.rect.contains(x, y) && is_mouse_key(&hit.key))
-                .map(|hit| {
-                    mouse_tooltip(
-                        hit,
-                        &actions_for(&state.snapshot.bindings, state.modifiers),
-                        state.modifiers,
-                    )
-                })
-                .or_else(|| {
-                    state
-                        .metrics
-                        .rows
-                        .iter()
-                        .find(|(rect, _)| rect.contains(x, y))
-                        .map(|(_, text)| text.clone())
-                });
-            drawing_area.set_tooltip_text(tooltip.as_deref());
+            drawing_area.set_tooltip_text(tooltip_at_pointer(&state).as_deref());
             if state.hovered != hovered {
                 state.hovered = hovered;
                 drawing_area.queue_draw();
@@ -388,6 +365,30 @@ fn build_window(
     window
 }
 
+fn tooltip_at_pointer(state: &OverlayState) -> Option<String> {
+    let (x, y) = state.metrics.pointer?;
+    state
+        .metrics
+        .hits
+        .iter()
+        .find(|hit| hit.rect.contains(x, y) && is_mouse_key(&hit.key))
+        .map(|hit| {
+            mouse_tooltip(
+                hit,
+                &actions_for(&state.snapshot.bindings, state.modifiers),
+                state.modifiers,
+            )
+        })
+        .or_else(|| {
+            state
+                .metrics
+                .rows
+                .iter()
+                .find(|(rect, _)| rect.contains(x, y))
+                .map(|(_, text)| text.clone())
+        })
+}
+
 fn select_monitor(window: &gtk::ApplicationWindow, connector: Option<&str>) {
     let (Some(connector), Some(display)) = (connector, gdk::Display::default()) else {
         return;
@@ -499,9 +500,6 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
         .map(|binding| binding.key.clone())
         .collect();
 
-    let outer_padding = 24.0;
-    let header_height = 82.0;
-    let detail_height = 66.0;
     let touch_rows = if state.snapshot.pointing.touchpads.is_empty() {
         Vec::new()
     } else {
@@ -509,15 +507,32 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
     };
     let layout = overlay_layout(width, height, state);
     let panel = layout.keyboard;
+    let (outer_padding, header_height, detail_height) = layout.chrome();
     let unit = layout.unit;
     let board_width = state.geometry.width * unit;
     let board_height = state.geometry.height * unit;
+    let old_panels = state.metrics.panels.clone();
     state.metrics.panel = panel;
     state.metrics.panels = vec![panel, layout.search];
     state.metrics.panels.extend(layout.mouse);
     state.metrics.panels.extend(layout.touchpad);
     state.metrics.hits.clear();
     state.metrics.rows.clear();
+    if old_panels != state.metrics.panels {
+        state.hovered = state.metrics.pointer.and_then(|(x, y)| {
+            layout
+                .keyboard_hits(&state.geometry)
+                .into_iter()
+                .chain(
+                    layout
+                        .mouse
+                        .into_iter()
+                        .flat_map(|panel| mouse_geometry(panel, &mouse_keys).1),
+                )
+                .find(|hit| hit.rect.contains(x, y))
+                .map(|hit| hit.key)
+        });
+    }
 
     rounded_rectangle(context, panel, 18.0);
     set_source(context, palette.background.with_alpha(0.985));
@@ -531,28 +546,26 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
     draw_header(
         context,
         state,
-        content_x,
-        panel.y + outer_padding,
-        board_width,
+        Rect {
+            x: content_x,
+            y: panel.y + outer_padding,
+            width: board_width,
+            height: header_height,
+        },
         palette,
     );
 
-    let key_gap = (unit * 0.075).clamp(3.0, 7.0);
-    for key in &state.geometry.keys {
-        let rect = Rect {
-            x: content_x + key.rect.x * unit + key_gap / 2.0,
-            y: board_y + key.rect.y * unit + key_gap / 2.0,
-            width: key.rect.width * unit - key_gap,
-            height: key.rect.height * unit - key_gap,
-        };
-        let key_actions = actions.get(&key.id);
-        let hovered = state.hovered.as_deref() == Some(key.id.as_str());
-        let modifier_active = modifier_key_active(&key.id, state.modifiers);
+    for hit in layout.keyboard_hits(&state.geometry) {
+        let rect = hit.rect;
+        let key = &hit.key;
+        let key_actions = actions.get(key);
+        let hovered = state.hovered.as_deref() == Some(key.as_str());
+        let modifier_active = modifier_key_active(key, state.modifiers);
         with_icon_atlas(|icon_atlas| {
             draw_key(
                 context,
                 rect,
-                &key.legend,
+                &hit.legend,
                 key_actions,
                 hovered,
                 modifier_active,
@@ -560,11 +573,7 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
                 palette,
             );
         });
-        state.metrics.hits.push(HitRegion {
-            rect,
-            key: key.id.clone(),
-            legend: key.legend.clone(),
-        });
+        state.metrics.hits.push(hit);
     }
 
     draw_search_panel(context, layout.search, state);
@@ -606,12 +615,50 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutMode {
+    Wide,
+    Portrait,
+    Compact,
+}
+
+#[derive(Debug)]
 struct PanelLayout {
+    mode: LayoutMode,
     keyboard: Rect,
     search: Rect,
     mouse: Option<Rect>,
     touchpad: Option<Rect>,
     unit: f64,
+}
+
+impl PanelLayout {
+    fn chrome(&self) -> (f64, f64, f64) {
+        if self.mode == LayoutMode::Compact {
+            (16.0, 60.0, 48.0)
+        } else {
+            (24.0, 82.0, 66.0)
+        }
+    }
+
+    fn keyboard_hits(&self, geometry: &KeyboardGeometry) -> Vec<HitRegion> {
+        let (padding, header, _) = self.chrome();
+        let gap = (self.unit * 0.075).clamp(3.0, 7.0).min(self.unit * 0.3);
+        geometry
+            .keys
+            .iter()
+            .map(|key| HitRegion {
+                rect: Rect {
+                    x: self.keyboard.x + padding + key.rect.x * self.unit + gap / 2.0,
+                    y: self.keyboard.y + padding + header + key.rect.y * self.unit + gap / 2.0,
+                    width: key.rect.width * self.unit - gap,
+                    height: key.rect.height * self.unit - gap,
+                },
+                key: key.id.clone(),
+                legend: key.legend.clone(),
+            })
+            .collect()
+    }
 }
 
 fn overlay_layout(width: f64, height: f64, state: &OverlayState) -> PanelLayout {
@@ -793,7 +840,162 @@ fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
     );
 }
 
+// GTK allocations are logical pixels; orientation follows the actual surface,
+// including monitor rotation and scale, without consulting compositor settings.
 fn panel_layout(
+    width: f64,
+    height: f64,
+    geometry: &KeyboardGeometry,
+    show_mouse: bool,
+    touch_rows: usize,
+    left: bool,
+) -> PanelLayout {
+    let wide = wide_panel_layout(width, height, geometry, show_mouse, touch_rows, left);
+    if width >= height && wide.unit >= 32.0 {
+        return wide;
+    }
+    let portrait = height > width;
+    let gap = 24.0;
+    let margin = (width.min(height) * 0.03).max(16.0);
+    let available_width = (width - 2.0 * margin).max(1.0);
+    let available_height = (height - 2.0 * margin).max(1.0);
+    let has_touch = touch_rows > 0;
+    let (padding, chrome) = if portrait {
+        (24.0, 196.0)
+    } else {
+        (16.0, 140.0)
+    };
+    let lower_minimum = if portrait && show_mouse && has_touch {
+        492.0
+    } else {
+        300.0
+    };
+    let unit = ((available_width - padding * 2.0) / geometry.width)
+        .min((available_height - gap - lower_minimum - chrome) / geometry.height)
+        .clamp(1.0, 78.0);
+    let keyboard_width = geometry.width * unit + padding * 2.0;
+    let keyboard_height = geometry.height * unit + chrome;
+    let desired_lower = if portrait {
+        let devices = if show_mouse { 450.0 } else { 0.0 }
+            + if has_touch {
+                (72.0 + touch_rows as f64 * 48.0).min(360.0)
+            } else {
+                0.0
+            }
+            + if show_mouse && has_touch { gap } else { 0.0 };
+        devices.max(600.0)
+    } else {
+        300.0
+    };
+    let lower_height = desired_lower.min((available_height - keyboard_height - gap).max(1.0));
+    // The support panels can be wider than a height-constrained keyboard.
+    let group_width = available_width.min(geometry.width * 78.0 + padding * 2.0);
+    let x = (width - group_width) / 2.0;
+    let y = (height - keyboard_height - gap - lower_height) / 2.0;
+    let keyboard = Rect {
+        x: (width - keyboard_width) / 2.0,
+        y,
+        width: keyboard_width,
+        height: keyboard_height,
+    };
+    let lower_y = y + keyboard_height + gap;
+    let mut search = Rect {
+        x,
+        y: lower_y,
+        width: group_width,
+        height: lower_height,
+    };
+    let mut mouse = None;
+    let mut touchpad = None;
+    if portrait && (show_mouse || has_touch) {
+        let device_width = (group_width * 0.44)
+            .clamp(210.0, 360.0)
+            .min((group_width - gap) / 2.0);
+        search.width = group_width - gap - device_width;
+        let device_x = if left && show_mouse {
+            search.x = x + device_width + gap;
+            x
+        } else {
+            x + search.width + gap
+        };
+        let mouse_height = if has_touch {
+            (lower_height - gap - 168.0).min(450.0)
+        } else {
+            lower_height.min(450.0)
+        };
+        if show_mouse {
+            mouse = Some(Rect {
+                x: device_x,
+                y: lower_y,
+                width: device_width,
+                height: mouse_height,
+            });
+        }
+        if has_touch {
+            let offset = if show_mouse { mouse_height + gap } else { 0.0 };
+            touchpad = Some(Rect {
+                x: device_x,
+                y: lower_y + offset,
+                width: device_width,
+                height: lower_height - offset,
+            });
+        }
+    } else if !portrait {
+        let mouse_width = if show_mouse {
+            (group_width * 0.26).clamp(210.0, 310.0)
+        } else {
+            0.0
+        };
+        let mouse_side = if show_mouse { mouse_width + gap } else { 0.0 };
+        let list_width = group_width - mouse_side;
+        search.width = if has_touch {
+            (list_width - gap) / 2.0
+        } else {
+            list_width
+        };
+        let mut next_x = x + search.width + gap;
+        if show_mouse && left {
+            mouse = Some(Rect {
+                x: next_x,
+                y: lower_y,
+                width: mouse_width,
+                height: lower_height,
+            });
+            next_x += mouse_width + gap;
+        }
+        if has_touch {
+            touchpad = Some(Rect {
+                x: next_x,
+                y: lower_y,
+                width: search.width,
+                height: lower_height,
+            });
+            next_x += search.width + gap;
+        }
+        if show_mouse && !left {
+            mouse = Some(Rect {
+                x: next_x,
+                y: lower_y,
+                width: mouse_width,
+                height: lower_height,
+            });
+        }
+    }
+    PanelLayout {
+        mode: if portrait {
+            LayoutMode::Portrait
+        } else {
+            LayoutMode::Compact
+        },
+        keyboard,
+        search,
+        mouse,
+        touchpad,
+        unit,
+    }
+}
+
+fn wide_panel_layout(
     width: f64,
     height: f64,
     geometry: &KeyboardGeometry,
@@ -857,6 +1059,7 @@ fn panel_layout(
         height: touch_height,
     });
     PanelLayout {
+        mode: LayoutMode::Wide,
         keyboard,
         search: Rect {
             x,
@@ -1255,7 +1458,13 @@ fn draw_scroll_rows(
             context,
             rect.x + 10.0,
             rect.y + 15.0,
-            &elide(&row.label, ((rect.width - 20.0) / 6.0) as usize),
+            &elide_to_width(
+                context,
+                &row.label,
+                rect.width - 20.0,
+                10.0,
+                FontWeight::Bold,
+            ),
             10.0,
             FontWeight::Bold,
             palette.accent,
@@ -1264,7 +1473,13 @@ fn draw_scroll_rows(
             context,
             rect.x + 10.0,
             rect.y + 32.0,
-            &elide(&row.action, ((rect.width - 20.0) / 5.8) as usize),
+            &elide_to_width(
+                context,
+                &row.action,
+                rect.width - 20.0,
+                10.5,
+                FontWeight::Normal,
+            ),
             10.5,
             FontWeight::Normal,
             palette.foreground,
@@ -1297,14 +1512,14 @@ fn draw_scroll_rows(
     let _ = context.restore();
 }
 
-fn draw_header(
-    context: &Context,
-    state: &OverlayState,
-    x: f64,
-    y: f64,
-    width: f64,
-    palette: Palette,
-) {
+fn draw_header(context: &Context, state: &OverlayState, rect: Rect, palette: Palette) {
+    let Rect {
+        x,
+        y,
+        width,
+        height,
+    } = rect;
+    let compact = height == 60.0;
     let title = if state.modifiers.is_empty() {
         "NO MODIFIERS".to_string()
     } else {
@@ -1313,7 +1528,7 @@ fn draw_header(
     draw_text(
         context,
         x,
-        y + 24.0,
+        y + if compact { 18.0 } else { 24.0 },
         &elide_to_width(context, &title, width, 22.0, FontWeight::Bold),
         22.0,
         FontWeight::Bold,
@@ -1322,7 +1537,7 @@ fn draw_header(
     draw_text(
         context,
         x,
-        y + 44.0,
+        y + if compact { 36.0 } else { 44.0 },
         &elide_to_width(
             context,
             &state.snapshot.device_name,
@@ -1342,7 +1557,7 @@ fn draw_header(
     draw_text(
         context,
         x,
-        y + 64.0,
+        y + if compact { 54.0 } else { 64.0 },
         &elide_to_width(context, message, width, 13.0, FontWeight::Normal),
         13.0,
         FontWeight::Normal,
@@ -1409,50 +1624,61 @@ fn draw_key(
         );
         return;
     }
+    let legend_y = (rect.height * 0.32).clamp(9.0, 14.0);
+    let legend_size = (rect.height * 0.16).clamp(8.0, 11.0);
+    let legend = elide_to_width(
+        context,
+        legend,
+        rect.width - 10.0,
+        legend_size,
+        FontWeight::Bold,
+    );
     draw_text(
         context,
-        rect.x + 7.0,
-        rect.y + 14.0,
-        legend,
-        (rect.height * 0.16).clamp(8.0, 11.0),
+        rect.x + 5.0,
+        rect.y + legend_y,
+        &legend,
+        legend_size,
         FontWeight::Bold,
         legend_color,
     );
 
     if let Some(actions) = actions {
+        let content = Rect {
+            x: rect.x + 4.0,
+            y: rect.y + legend_y + 2.0,
+            width: rect.width - 8.0,
+            height: rect.height - legend_y - 4.0,
+        };
+        let _ = context.save();
+        context.rectangle(content.x, content.y, content.width, content.height);
+        context.clip();
         let icons = icons_for_actions(actions);
         if let (Some(atlas), Some(icons)) = (icon_atlas, icons) {
-            draw_action_icons(
-                context,
-                atlas,
-                Rect {
-                    x: rect.x + 5.0,
-                    y: rect.y + rect.height * 0.3,
-                    width: rect.width - 10.0,
-                    height: rect.height * 0.64,
-                },
-                &icons,
-                palette.foreground,
-            );
+            draw_action_icons(context, atlas, content, &icons, palette.foreground);
         } else {
             let summary = actions.join(" · ");
-            let max_chars = ((rect.width - 10.0) / 6.1).floor().max(4.0) as usize;
-            let lines = wrap_two_lines(&summary, max_chars);
             let font_size = (rect.height * 0.155).clamp(8.0, 11.5);
-            let start_y =
-                rect.y + rect.height * 0.52 - (lines.len().saturating_sub(1) as f64 * 6.0);
+            let lines = if content.height >= font_size * 2.0 + 3.0 {
+                wrap_two_lines(&summary, (content.width / 6.1).floor().max(1.0) as usize)
+            } else {
+                vec![summary]
+            };
+            let text_height = font_size + (lines.len() - 1) as f64 * (font_size + 3.0);
+            let start_y = content.y + (content.height - text_height) / 2.0 + font_size;
             for (index, line) in lines.iter().enumerate() {
                 draw_text_centered(
                     context,
                     rect.x + rect.width / 2.0,
                     start_y + index as f64 * (font_size + 3.0),
-                    line,
+                    &elide_to_width(context, line, content.width, font_size, FontWeight::Normal),
                     font_size,
                     FontWeight::Normal,
                     palette.foreground,
                 );
             }
         }
+        let _ = context.restore();
     }
 }
 
@@ -1498,6 +1724,8 @@ fn draw_details(
     set_source(context, palette.darker_background.with_alpha(0.72));
     let _ = context.fill();
 
+    let second_line = (rect.height - 8.0).min(42.0);
+    let first_line = (second_line - 18.0).min(21.0);
     let hovered = state.hovered.as_ref().and_then(|key| {
         state
             .metrics
@@ -1513,7 +1741,7 @@ fn draw_details(
             draw_text(
                 context,
                 rect.x + 14.0,
-                rect.y + 21.0,
+                rect.y + first_line,
                 &elide_to_width(context, &chord, rect.width - 28.0, 12.0, FontWeight::Bold),
                 12.0,
                 FontWeight::Bold,
@@ -1522,7 +1750,7 @@ fn draw_details(
             draw_text(
                 context,
                 rect.x + 14.0,
-                rect.y + 42.0,
+                rect.y + second_line,
                 &elide_to_width(
                     context,
                     &key_actions.join("  •  "),
@@ -1539,7 +1767,7 @@ fn draw_details(
             draw_text(
                 context,
                 rect.x + 14.0,
-                rect.y + 33.0,
+                rect.y + (rect.height + 13.0) / 2.0,
                 &elide_to_width(
                     context,
                     &format!(
@@ -1559,7 +1787,7 @@ fn draw_details(
             draw_text(
                 context,
                 rect.x + 14.0,
-                rect.y + 21.0,
+                rect.y + first_line,
                 &elide_to_width(
                     context,
                     "Hover a key or mouse control for details",
@@ -1574,7 +1802,7 @@ fn draw_details(
             draw_text(
                 context,
                 rect.x + 14.0,
-                rect.y + 42.0,
+                rect.y + second_line,
                 "Esc or backdrop to close",
                 12.0,
                 FontWeight::Normal,
@@ -2209,8 +2437,41 @@ mod tests {
         }
     }
 
+    fn assert_contains(outer: Rect, inner: Rect) {
+        let epsilon = 0.001;
+        assert!(inner.width > 0.0 && inner.height > 0.0, "{inner:?}");
+        assert!(
+            inner.x >= outer.x - epsilon
+                && inner.y >= outer.y - epsilon
+                && inner.x + inner.width <= outer.x + outer.width + epsilon
+                && inner.y + inner.height <= outer.y + outer.height + epsilon,
+            "{inner:?} outside {outer:?}"
+        );
+    }
+
+    fn assert_separated(a: Rect, b: Rect) {
+        let epsilon = 0.001;
+        assert!(
+            a.x + a.width + 24.0 <= b.x + epsilon
+                || b.x + b.width + 24.0 <= a.x + epsilon
+                || a.y + a.height + 24.0 <= b.y + epsilon
+                || b.y + b.height + 24.0 <= a.y + epsilon,
+            "{a:?} overlaps {b:?}"
+        );
+    }
+
     #[test]
     fn panel_layout_keeps_all_devices_on_screen_and_gaps_outside_hit_regions() {
+        let keys = [
+            "MOUSE_SCROLL_LEFT",
+            "MOUSE_SCROLL_RIGHT",
+            "MOUSE:275",
+            "MOUSE:276",
+            "MOUSE:277",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         for keyboard in [
             KeyboardLayout::Full,
             KeyboardLayout::Tkl,
@@ -2218,86 +2479,189 @@ mod tests {
             KeyboardLayout::Compact65,
             KeyboardLayout::Compact60,
         ] {
-            for (width, height) in [(1920.0, 1080.0), (1280.0, 720.0), (1024.0, 600.0)] {
+            let geometry = KeyboardGeometry::new(keyboard);
+            for (width, height) in [
+                (1280.0, 720.0),
+                (1920.0, 1080.0),
+                (2560.0, 1440.0),
+                (720.0, 1280.0),
+                (1080.0, 1920.0),
+                (1000.0, 1000.0),
+                (720.0, 720.0),
+                (1024.0, 600.0),
+                (600.0, 1024.0),
+            ] {
                 for left in [false, true] {
-                    for touch in [0, 20] {
-                        let layout = panel_layout(
-                            width,
-                            height,
-                            &KeyboardGeometry::new(keyboard),
-                            true,
-                            touch,
-                            left,
-                        );
-                        let mut panels = vec![layout.keyboard, layout.search];
-                        panels.extend(layout.mouse);
-                        panels.extend(layout.touchpad);
-                        for panel in &panels {
-                            assert!(
-                                panel.x >= 0.0
-                                    && panel.y >= 0.0
-                                    && panel.x + panel.width <= width + 0.01
-                                    && panel.y + panel.height <= height + 0.01
-                            );
-                        }
-                        for (i, a) in panels.iter().enumerate() {
-                            for b in panels.iter().skip(i + 1) {
+                    for show_mouse in [false, true] {
+                        for touch in [0, 1, 20, 100] {
+                            let layout =
+                                panel_layout(width, height, &geometry, show_mouse, touch, left);
+                            let mut panels = vec![layout.keyboard, layout.search];
+                            panels.extend(layout.mouse);
+                            panels.extend(layout.touchpad);
+                            let screen = Rect {
+                                x: 0.0,
+                                y: 0.0,
+                                width,
+                                height,
+                            };
+                            for (i, panel) in panels.iter().enumerate() {
+                                assert_contains(screen, *panel);
+                                for other in panels.iter().skip(i + 1) {
+                                    assert_separated(*panel, *other);
+                                }
+                            }
+                            assert!(layout.unit > 0.0 && layout.unit <= 78.0);
+                            assert_contains(layout.search, search_entry_rect(layout.search));
+                            assert!(layout.search.height > 124.0);
+                            for hit in layout.keyboard_hits(&geometry) {
+                                assert_contains(layout.keyboard, hit.rect);
+                            }
+                            assert_eq!(layout.mouse.is_some(), show_mouse);
+                            assert_eq!(layout.touchpad.is_some(), touch > 0);
+                            if let Some(mouse) = layout.mouse {
+                                let (body, hits) = mouse_geometry(mouse, &keys);
+                                assert_contains(mouse, body);
+                                for hit in hits {
+                                    assert_contains(mouse, hit.rect);
+                                }
+                                if layout.mode == LayoutMode::Wide {
+                                    assert_eq!(mouse.x < layout.keyboard.x, left);
+                                } else if layout.mode == LayoutMode::Portrait {
+                                    assert_eq!(mouse.x < layout.search.x, left);
+                                } else if let Some(pad) = layout.touchpad {
+                                    assert_eq!(mouse.x < pad.x, left);
+                                }
+                            }
+                            if let Some(pad) = layout.touchpad {
+                                assert!(pad.height > 72.0);
+                            }
+                            let metrics = RenderMetrics {
+                                panels,
+                                ..Default::default()
+                            };
+                            for panel in &metrics.panels {
+                                assert!(metrics.contains_panel(panel.x + 1.0, panel.y + 1.0));
                                 assert!(
-                                    a.x + a.width <= b.x
-                                        || b.x + b.width <= a.x
-                                        || a.y + a.height <= b.y
-                                        || b.y + b.height <= a.y
+                                    !metrics.contains_panel(
+                                        panel.x + panel.width / 2.0,
+                                        panel.y - 12.0
+                                    )
                                 );
                             }
-                        }
-                        let mouse = layout.mouse.unwrap();
-                        let keyboard = layout.keyboard;
-                        let search = layout.search;
-                        let neighbor = if left { mouse } else { keyboard };
-                        assert!((neighbor.x - search.x - search.width - 24.0).abs() < 0.001);
-                        let entry = search_entry_rect(search);
-                        assert!(search.contains(entry.x, entry.y));
-                        assert!(search.contains(entry.x + entry.width, entry.y + entry.height));
-                        assert!(
-                            (mouse.y + mouse.height / 2.0 - keyboard.y - keyboard.height / 2.0)
-                                .abs()
-                                < 0.001
-                        );
-                        let gap_x = if left {
-                            mouse.x + mouse.width + 12.0
-                        } else {
-                            keyboard.x + keyboard.width + 12.0
-                        };
-                        let metrics = RenderMetrics {
-                            panels,
-                            ..Default::default()
-                        };
-                        assert!(!metrics.contains_panel(gap_x, mouse.y + mouse.height / 2.0));
-                        assert!(
-                            !metrics
-                                .contains_panel(search.x + search.width + 12.0, search.y + 10.0)
-                        );
-                        assert!(metrics.contains_panel(mouse.x + 1.0, mouse.y + 1.0));
-                        if let Some(pad) = layout.touchpad {
-                            assert!(
-                                (pad.x + pad.width / 2.0 - keyboard.x - keyboard.width / 2.0).abs()
-                                    < 0.001
-                            );
-                            assert!(!metrics.contains_panel(pad.x + 20.0, pad.y - 12.0));
+                            if layout.mode != LayoutMode::Wide {
+                                assert!(
+                                    layout.search.y
+                                        >= layout.keyboard.y + layout.keyboard.height + 24.0
+                                            - 0.001
+                                );
+                            }
                         }
                     }
                 }
             }
         }
-        let layout = panel_layout(
-            1280.0,
-            720.0,
-            &KeyboardGeometry::new(KeyboardLayout::Tkl),
-            false,
-            0,
-            false,
-        );
-        assert!(layout.mouse.is_none() && layout.touchpad.is_none());
+    }
+
+    #[test]
+    fn layout_switches_at_orientation_and_readability_boundaries() {
+        let geometry = KeyboardGeometry::new(KeyboardLayout::Full);
+        for (width, height) in [(999.0, 1000.0), (1000.0, 1000.0), (1001.0, 1000.0)] {
+            let layout = panel_layout(width, height, &geometry, true, 20, false);
+            assert_eq!(layout.mode == LayoutMode::Portrait, height > width);
+        }
+        // Locate the width threshold without duplicating the layout arithmetic.
+        let width = (1280..1920)
+            .find(|width| {
+                wide_panel_layout(*width as f64, 1080.0, &geometry, true, 20, false).unit >= 32.0
+            })
+            .unwrap() as f64;
+        let (mut low, mut high) = (width - 1.0, width);
+        for _ in 0..40 {
+            let middle = (low + high) / 2.0;
+            if wide_panel_layout(middle, 1080.0, &geometry, true, 20, false).unit < 32.0 {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        for (width, mode) in [(low, LayoutMode::Compact), (high, LayoutMode::Wide)] {
+            assert_eq!(
+                panel_layout(width, 1080.0, &geometry, true, 20, false).mode,
+                mode
+            );
+        }
+        let wide = wide_panel_layout(1280.0, 720.0, &geometry, true, 20, false);
+        let compact = panel_layout(1280.0, 720.0, &geometry, true, 20, false);
+        assert_eq!(compact.mode, LayoutMode::Compact);
+        assert!(compact.unit >= 32.0 && compact.unit > wide.unit);
+        assert_eq!(compact.chrome(), (16.0, 60.0, 48.0));
+        assert!(compact.search.height >= 300.0 - 0.001);
+    }
+
+    #[test]
+    fn resizing_preserves_filters_and_refreshes_hover_and_scroll_geometry() {
+        let surface = ImageSurface::create(Format::ARgb32, 1920, 1920).unwrap();
+        let context = Context::new(&surface).unwrap();
+        let mut state = fixture_state(KeyboardLayout::Full, false, true);
+        for index in 0..100 {
+            state.snapshot.bindings.push(Binding {
+                modifiers: Modifiers::SUPER,
+                key: "MOUSE_LEFT".into(),
+                action: format!("Extra action {index:03}"),
+            });
+        }
+        state.query = "Extra".into();
+        state.held_modifiers = Modifiers::SUPER;
+        draw_overlay(&context, 1920.0, 1080.0, &mut state);
+        let hit = state
+            .metrics
+            .hits
+            .iter()
+            .find(|hit| hit.key == "MOUSE_LEFT")
+            .unwrap();
+        state.metrics.pointer = Some((hit.rect.x + 1.0, hit.rect.y + 1.0));
+        state.hovered = Some(hit.key.clone());
+        assert!(tooltip_at_pointer(&state).is_some());
+        state.metrics.search.offset = state.metrics.search.maximum;
+        state.metrics.touchpad.offset = state.metrics.touchpad.maximum;
+        for (width, height) in [
+            (720.0, 1280.0),
+            (1280.0, 720.0),
+            (1080.0, 1920.0),
+            (1920.0, 1080.0),
+        ] {
+            draw_overlay(&context, width, height, &mut state);
+            assert_eq!(state.query, "Extra");
+            assert_eq!(state.modifiers, Modifiers::SUPER);
+            assert_eq!(state.held_modifiers, Modifiers::SUPER);
+            let (x, y) = state.metrics.pointer.unwrap();
+            assert_eq!(
+                state.hovered,
+                state
+                    .metrics
+                    .hits
+                    .iter()
+                    .find(|hit| hit.rect.contains(x, y))
+                    .map(|hit| hit.key.clone())
+            );
+            for scroll in [&state.metrics.search, &state.metrics.touchpad] {
+                assert!(scroll.offset >= 0.0 && scroll.offset <= scroll.maximum);
+            }
+            for (rect, _) in &state.metrics.rows {
+                let viewport = if state.metrics.search.rect.contains(rect.x, rect.y) {
+                    state.metrics.search.rect
+                } else {
+                    state.metrics.touchpad.rect
+                };
+                assert_contains(viewport, *rect);
+            }
+            let search = state.metrics.search.rect;
+            state.metrics.pointer = Some((search.x + 5.0, search.y + 5.0));
+            let touch_offset = state.metrics.touchpad.offset;
+            assert!(state.metrics.scroll(-1.0));
+            assert_eq!(state.metrics.touchpad.offset, touch_offset);
+        }
     }
 
     #[test]
@@ -2345,6 +2709,19 @@ mod tests {
         }
         for (name, layout, width, height, left, touch) in [
             ("full", KeyboardLayout::Full, 1920, 1080, false, true),
+            ("full-compact", KeyboardLayout::Full, 1280, 720, false, true),
+            ("portrait", KeyboardLayout::Full, 720, 1280, false, true),
+            ("portrait-left", KeyboardLayout::Tkl, 1080, 1920, true, true),
+            (
+                "portrait-search",
+                KeyboardLayout::Compact60,
+                720,
+                1280,
+                false,
+                false,
+            ),
+            ("square", KeyboardLayout::Full, 1000, 1000, false, true),
+            ("long-labels", KeyboardLayout::Full, 720, 1280, true, true),
             ("tkl-left", KeyboardLayout::Tkl, 1920, 1080, true, true),
             ("75", KeyboardLayout::Compact75, 1280, 720, false, true),
             ("65", KeyboardLayout::Compact65, 1280, 720, true, true),
@@ -2372,6 +2749,21 @@ mod tests {
             let surface = ImageSurface::create(Format::ARgb32, width, height).unwrap();
             let context = Context::new(&surface).unwrap();
             let mut state = fixture_state(layout, left, touch);
+            if name == "long-labels" {
+                state.snapshot.device_name =
+                    "A keyboard with an unusually long manufacturer and model name".repeat(3);
+                for index in 0..100 {
+                    state.snapshot.bindings.push(Binding { modifiers: Modifiers::SUPER,
+                        key: "MOUSE_LEFT".into(), action: format!("{index}: A very long action containing WWWWW and unicode 漢字 to exercise fitting") });
+                }
+            }
+            if name == "portrait-search" {
+                state.snapshot.pointing.mice.clear();
+                state
+                    .snapshot
+                    .bindings
+                    .retain(|binding| !is_mouse_key(&binding.key));
+            }
             if name.starts_with("search-") {
                 state.modifiers = Modifiers::default();
                 state.query = match name {
@@ -2387,7 +2779,16 @@ mod tests {
                 });
             }
             draw_overlay(&context, width as f64, height as f64, &mut state);
-            assert_eq!(state.metrics.panels.len(), if touch { 4 } else { 3 });
+            assert_eq!(
+                state.metrics.panels.len(),
+                if touch {
+                    4
+                } else if name == "portrait-search" {
+                    2
+                } else {
+                    3
+                }
+            );
             if name == "mouse-only" {
                 for (label, modifiers) in [
                     ("none", Modifiers::default()),
@@ -2419,6 +2820,50 @@ mod tests {
             }
         }
     }
+    #[test]
+    #[ignore = "requires a graphical session; allocates an unmapped GTK window"]
+    fn native_search_entry_tracks_responsive_layout() {
+        gtk::init().unwrap();
+        let application = gtk::Application::builder()
+            .application_id("dev.keywrld.LayoutTest")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(None::<&gtk::gio::Cancellable>)
+            .unwrap();
+        let state = fixture_state(KeyboardLayout::Full, false, true);
+        let window = build_window(&application, state.snapshot.clone());
+        let overlay = window.child().unwrap().downcast::<gtk::Overlay>().unwrap();
+        let entry = overlay
+            .last_child()
+            .unwrap()
+            .downcast::<gtk::Entry>()
+            .unwrap();
+        entry.set_text("preserved query");
+        if let Ok(scale) = std::env::var("GDK_SCALE") {
+            assert_eq!(entry.scale_factor(), scale.parse::<i32>().unwrap());
+        }
+        for (width, height) in [(1280, 720), (720, 1280), (1920, 1080), (1080, 1920)] {
+            overlay.allocate(width, height, -1, None);
+            let expected =
+                search_entry_rect(overlay_layout(width as f64, height as f64, &state).search);
+            let bounds = entry.compute_bounds(&overlay).unwrap();
+            for (actual, expected) in [
+                (bounds.x() as f64, expected.x),
+                (bounds.y() as f64, expected.y),
+                (bounds.width() as f64, expected.width),
+                (bounds.height() as f64, expected.height),
+            ] {
+                assert!(
+                    (actual - expected.round()).abs() <= 1.0,
+                    "{bounds:?} != {expected}"
+                );
+            }
+            assert_eq!(entry.text().as_str(), "preserved query");
+        }
+        window.close();
+    }
+
     #[test]
     #[ignore = "requires a live Hyprland session; writes a preview under target"]
     fn render_live_devices() {
