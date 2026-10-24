@@ -13,8 +13,9 @@ the same modifier selection, highlighting its bound buttons and scroll wheel.
 
 ![keywrld shortcut overlay with keyboard and mouse panels](assets/readme/screenshot.png)
 
-[Watch the demo](assets/readme/demo.mp4): fuzzy search, multiple modifiers,
-hover details, and scrolling through shortcuts.
+Demo, showing fuzzy search, multiple modifiers, hover details, and scrolling through shortcuts:
+
+https://github.com/user-attachments/assets/60ed4653-dc98-403b-926f-6789111ab857
 
 ## Runtime requirements
 
