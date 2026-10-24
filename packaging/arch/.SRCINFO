@@ -1,6 +1,6 @@
 pkgbase = keywrld
 	pkgdesc = A keyboard-shaped Hyprland system shortcut overlay
-	pkgver = 0.1.6
+	pkgver = 0.1.7
 	pkgrel = 1
 	url = https://github.com/mks-m/keywrld
 	arch = x86_64
@@ -18,7 +18,7 @@ pkgbase = keywrld
 	depends = libgcc
 	depends = pango
 	optdepends = omarchy: Lua binding supplements and desktop theme integration
-	source = keywrld-0.1.6.tar.gz::https://github.com/mks-m/keywrld/archive/refs/tags/v0.1.6.tar.gz
+	source = keywrld-0.1.7.tar.gz::https://github.com/mks-m/keywrld/archive/refs/tags/v0.1.7.tar.gz
 	sha256sums = TODO_RELEASE_SHA256
 
 pkgname = keywrld
