@@ -19,6 +19,11 @@ the same modifier selection, highlighting its bound buttons and scroll wheel.
 
 ## Build
 
+Arch packaging and AUR release instructions are in
+[packaging/arch/README.md](packaging/arch/README.md).
+Use `scripts/release.py prepare VERSION` to prepare a release and
+`scripts/release.py publish` to publish it on GitHub.
+
 ```sh
 cargo build --release
 install -Dm755 target/release/keywrld ~/.local/bin/keywrld

@@ -4,6 +4,8 @@ version = "0.1.6"
 edition = "2024"
 rust-version = "1.92"
 description = "A keyboard-shaped Hyprland system shortcut overlay"
+license = "MIT"
+repository = "https://github.com/mks-m/keywrld"
 
 [dependencies]
 cairo-rs = { version = "0.22.0", features = ["png"] }

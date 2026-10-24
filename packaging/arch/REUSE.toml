@@ -1,0 +1,6 @@
+version = 1
+
+[[annotations]]
+path = ["PKGBUILD", ".SRCINFO", "README.md", "REUSE.toml"]
+SPDX-FileCopyrightText = "NONE"
+SPDX-License-Identifier = "0BSD"
