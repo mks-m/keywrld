@@ -72,8 +72,32 @@ def publish():
     test()
     # Push the exact release commit under a new tag; never force an existing tag.
     run("git", "push", f"https://github.com/{REPO}.git", f"{commit}:refs/tags/{tag}")
+    create_release()
+
+
+def create_release():
+    """Resume release creation using the existing remote tag, not local HEAD."""
+    tag = f"v{version()}"
+    refs = run("git", "ls-remote", f"https://github.com/{REPO}.git",
+               f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}", capture=True)
+    targets = dict(line.split()[::-1] for line in refs.splitlines())
+    commit = targets.get(f"refs/tags/{tag}^{{}}", targets.get(f"refs/tags/{tag}"))
+    if not commit:
+        raise ValueError(f"Remote tag {tag} does not exist; run publish first")
+    releases = run("gh", "api", "--paginate", f"repos/{REPO}/releases",
+                   "--jq", '.[] | [.tag_name, .draft] | @tsv', capture=True)
+    existing = dict(line.split("\t") for line in releases.splitlines())
+    if tag in existing:
+        if existing[tag] == "true":
+            run("gh", "release", "edit", tag, "--repo", REPO, "--draft=false")
+        else:
+            print(f"Release {tag} is already published; refreshing packaging.")
+        package_metadata()
+        return
+    # Explicit target also works for a new repository whose default branch
+    # has not been pushed yet. --verify-tag alone still leaves that default.
     run("gh", "release", "create", tag, "--repo", REPO, "--verify-tag",
-        "--title", tag, "--generate-notes")
+        "--target", commit, "--title", tag, "--generate-notes")
     package_metadata()
 
 
@@ -100,12 +124,15 @@ def main():
     commands.add_parser("prepare", help="Update versions and run tests").add_argument("version")
     commands.add_parser("publish", help="Push the clean commit as a tag and publish on GitHub")
     commands.add_parser("package", help="Refresh checksum/.SRCINFO for the published version")
+    commands.add_parser("resume", help="Create a release from its existing remote tag, then refresh packaging")
     args = parser.parse_args()
     try:
         if args.command == "prepare":
             prepare(args.version)
         elif args.command == "publish":
             publish()
+        elif args.command == "resume":
+            create_release()
         else:
             package_metadata()
     except (ValueError, subprocess.CalledProcessError, OSError) as error:

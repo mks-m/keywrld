@@ -13,7 +13,7 @@ makedepends=('cargo' 'pkgconf')
 optdepends=('omarchy: Lua binding supplements and desktop theme integration')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 # Replace with the published archive's SHA-256; do not use SKIP for releases.
-sha256sums=('TODO_RELEASE_SHA256')
+sha256sums=('0b8ca3c1c216f8c260b1d2776bd1f4b58bd73bb80c0feab05794d431239c7f5c')
 
 prepare() {
   cd "$pkgname-$pkgver"

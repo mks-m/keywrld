@@ -36,8 +36,12 @@ regenerates .SRCINFO, and verifies the package source. Review and commit these
 packaging changes separately: the archive must exist before its checksum can be
 recorded. Do not move the published tag to include that follow-up commit.
 
-If publishing stops after pushing the tag, create the release with
-`gh release create vVERSION --repo mks-m/keywrld --verify-tag --generate-notes`.
+If publishing stops after pushing the tag, run `scripts/release.py resume`.
+It resolves the existing remote tag to its commit and passes that target
+explicitly to GitHub, including when the default branch has not been pushed.
+It does not move the tag or publish the current local HEAD.
+If the release already exists, resume reuses it (publishing it if it is a draft)
+and continues with packaging metadata. API failures stop the operation.
 If the release exists but downloading or packaging failed, rerun
 `scripts/release.py package`. Never overwrite a released version to retry.
 
