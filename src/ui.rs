@@ -14,7 +14,7 @@ use crate::core::{
 use crate::icons::{ActionIcon, IconAtlas, icons_for_actions, with_icon_atlas};
 use crate::peripherals::{PeripheralRow, touchpad_rows};
 use crate::style::{Color, ControlStyle, Style};
-use crate::system::{RuntimeSnapshot, load_runtime};
+use crate::system::{RuntimeSnapshot, execute_binding, load_runtime};
 
 #[derive(Clone, Debug)]
 struct HitRegion {
@@ -70,8 +70,61 @@ struct OverlayState {
     held_modifiers: Modifiers,
     modifiers: Modifiers,
     query: String,
+    selected_shortcut_index: usize,
     hovered: Option<String>,
     metrics: RenderMetrics,
+}
+
+impl OverlayState {
+    fn reset_search_selection(&mut self) {
+        self.selected_shortcut_index = 0;
+        self.metrics.search.offset = 0.0;
+    }
+
+    fn set_query(&mut self, query: String) {
+        self.query = query;
+        self.reset_search_selection();
+    }
+
+    fn selected_shortcut(&self) -> Option<&crate::core::Binding> {
+        if self.query.trim().is_empty() {
+            return None;
+        }
+        shortcut_rows(&self.snapshot.bindings, self.modifiers, &self.query)
+            .get(self.selected_shortcut_index)
+            .map(|row| row.binding)
+    }
+
+    fn navigate_search(&mut self, key: gdk::Key) -> bool {
+        let down = match key {
+            gdk::Key::Down | gdk::Key::KP_Down => true,
+            gdk::Key::Up | gdk::Key::KP_Up => false,
+            _ => return false,
+        };
+        if self.query.trim().is_empty() {
+            return false;
+        }
+        let count = shortcut_rows(&self.snapshot.bindings, self.modifiers, &self.query).len();
+        if count == 0 {
+            return true;
+        }
+        self.selected_shortcut_index = if down {
+            (self.selected_shortcut_index + 1) % count
+        } else if self.selected_shortcut_index == 0 {
+            count - 1
+        } else {
+            self.selected_shortcut_index - 1
+        };
+        let height = self.style.row_height();
+        let top = self.selected_shortcut_index as f64 * (height + self.style.row_gap);
+        let scroll = &mut self.metrics.search;
+        if top < scroll.offset {
+            scroll.offset = top;
+        } else if top + height > scroll.offset + scroll.rect.height {
+            scroll.offset = (top + height - scroll.rect.height).max(0.0);
+        }
+        true
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -179,6 +232,7 @@ fn build_window(
         held_modifiers: Modifiers::default(),
         modifiers: Modifiers::default(),
         query: String::new(),
+        selected_shortcut_index: 0,
         hovered: None,
         metrics: RenderMetrics::default(),
     }));
@@ -290,6 +344,11 @@ fn build_window(
                 }
                 return gtk::glib::Propagation::Stop;
             }
+            if state.borrow_mut().navigate_search(key) {
+                drawing_area.set_tooltip_text(None);
+                drawing_area.queue_draw();
+                return gtk::glib::Propagation::Stop;
+            }
             if let Some(modifiers) = candidate {
                 update_held_modifiers(&state, &drawing_area, modifiers);
             }
@@ -338,10 +397,26 @@ fn build_window(
         let drawing_area = drawing_area.clone();
         move |entry| {
             let mut state = state.borrow_mut();
-            state.query = entry.text().to_string();
-            state.metrics.search.offset = 0.0;
+            state.set_query(entry.text().to_string());
             drawing_area.set_tooltip_text(None);
             drawing_area.queue_draw();
+        }
+    });
+    search.connect_activate({
+        let state = state.clone();
+        let window = window.downgrade();
+        move |_| {
+            let binding = state.borrow().selected_shortcut().cloned();
+            let (Some(binding), Some(window)) = (binding, window.upgrade()) else {
+                return;
+            };
+            let display = gtk::prelude::WidgetExt::display(&window);
+            window.close();
+            // Release the overlay's focus before dispatching window actions.
+            display.sync();
+            if let Err(error) = execute_binding(&binding) {
+                eprintln!("keywrld: {error}");
+            }
         }
     });
     let overlay = gtk::Overlay::new();
@@ -465,7 +540,7 @@ fn update_held_modifiers(
     if state.modifiers != modifiers || state.held_modifiers != held_modifiers {
         state.held_modifiers = held_modifiers;
         state.modifiers = modifiers;
-        state.metrics.search.offset = 0.0;
+        state.reset_search_selection();
         state.hovered = None;
         drawing_area.set_tooltip_text(None);
         drawing_area.queue_draw();
@@ -480,7 +555,7 @@ fn toggle_latched_modifier(
     let mut state = state.borrow_mut();
     state.latched_modifiers = state.latched_modifiers.toggled(modifier);
     state.modifiers = state.latched_modifiers.with(state.held_modifiers);
-    state.metrics.search.offset = 0.0;
+    state.reset_search_selection();
     state.hovered = None;
     drawing_area.set_tooltip_text(None);
     drawing_area.queue_draw();
@@ -710,11 +785,17 @@ fn fuzzy_token_score(field: &str, token: &str) -> Option<(usize, usize, usize)> 
     None
 }
 
-fn shortcut_rows(
-    bindings: &[crate::core::Binding],
+#[derive(Debug, PartialEq, Eq)]
+struct ShortcutRow<'a> {
+    label: String,
+    binding: &'a crate::core::Binding,
+}
+
+fn shortcut_rows<'a>(
+    bindings: &'a [crate::core::Binding],
     modifiers: Modifiers,
     query: &str,
-) -> Vec<PeripheralRow> {
+) -> Vec<ShortcutRow<'a>> {
     let tokens: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
     let mut seen = BTreeSet::new();
     let mut matches = Vec::new();
@@ -738,13 +819,13 @@ fn shortcut_rows(
                 .map(|score| (total.0 + score.0, total.1 + score.1, total.2 + score.2))
         });
         if let Some(score) = score {
-            matches.push((score, label, binding.action.clone()));
+            matches.push((score, label, binding));
         }
     }
-    matches.sort();
+    matches.sort_by(|a, b| (&a.0, &a.1, &a.2.action).cmp(&(&b.0, &b.1, &b.2.action)));
     matches
         .into_iter()
-        .map(|(_, label, action)| PeripheralRow { label, action })
+        .map(|(_, label, binding)| ShortcutRow { label, binding })
         .collect()
 }
 
@@ -927,8 +1008,18 @@ fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
             .metrics
             .pointer
             .is_some_and(|(x, y)| viewport.contains(x, y) && rect.contains(x, y));
-        if hovered {
-            draw_surface(context, rect, style.radius, style.row_hover);
+        let selected = index == state.selected_shortcut_index && !state.query.trim().is_empty();
+        if selected || hovered {
+            draw_surface(
+                context,
+                rect,
+                style.radius,
+                if selected {
+                    style.selected
+                } else {
+                    style.row_hover
+                },
+            );
         }
         let text_rect = Rect {
             x: rect.x + style.row_padding_x,
@@ -953,10 +1044,12 @@ fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
                 height: style.body * 1.5,
                 ..text_rect
             },
-            &row.action,
+            &row.binding.action,
             style.body,
             FontWeight::Normal,
-            if hovered {
+            if selected {
+                style.selected_text
+            } else if hovered {
                 style.row_hover_text
             } else {
                 style.foreground
@@ -970,7 +1063,7 @@ fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
                 height: bottom - top,
                 ..rect
             },
-            format!("{}\n{}", row.label, row.action),
+            format!("{}\n{}", row.label, row.binding.action),
         ));
     }
     if scroll.maximum > 0.0 && viewport.height > 0.0 {
@@ -2204,14 +2297,16 @@ mod tests {
             "Plain action",
             "Second action",
         ] {
-            assert!(rows.iter().any(|row| row.action == description));
+            assert!(rows.iter().any(|row| row.binding.action == description));
         }
         assert_eq!(rows, shortcut_rows(&bindings, Modifiers::default(), "   "));
         let mut reversed = bindings.clone();
         reversed.reverse();
         assert_eq!(rows, shortcut_rows(&reversed, Modifiers::default(), ""));
         assert_eq!(
-            rows.iter().filter(|row| row.action == "Terminal").count(),
+            rows.iter()
+                .filter(|row| row.binding.action == "Terminal")
+                .count(),
             1
         );
     }
@@ -2223,7 +2318,9 @@ mod tests {
         );
         assert_eq!(shortcut_rows(&bindings, Modifiers::SUPER, "trm").len(), 1);
         assert_eq!(
-            shortcut_rows(&bindings, Modifiers::SUPER.with(Modifiers::SHIFT), "trm")[0].action,
+            shortcut_rows(&bindings, Modifiers::SUPER.with(Modifiers::SHIFT), "trm")[0]
+                .binding
+                .action,
             "Open terminal split"
         );
         assert_eq!(
@@ -2232,18 +2329,24 @@ mod tests {
         );
         for query in ["RETURN", "EnTeR", "sup trm", "super return term"] {
             assert_eq!(
-                shortcut_rows(&bindings, Modifiers::SUPER, query)[0].action,
+                shortcut_rows(&bindings, Modifiers::SUPER, query)[0]
+                    .binding
+                    .action,
                 "Open terminal"
             );
         }
         for query in ["mouse_left", "left click", "mv wnd"] {
             assert_eq!(
-                shortcut_rows(&bindings, Modifiers::default(), query)[0].action,
+                shortcut_rows(&bindings, Modifiers::default(), query)[0]
+                    .binding
+                    .action,
                 "Move window"
             );
         }
         assert_eq!(
-            shortcut_rows(&bindings, Modifiers::default(), "audiomute")[0].action,
+            shortcut_rows(&bindings, Modifiers::default(), "audiomute")[0]
+                .binding
+                .action,
             "Silence sound"
         );
         assert!(shortcut_rows(&bindings, Modifiers::CTRL, "").is_empty());
@@ -2259,7 +2362,7 @@ mod tests {
         let rows = shortcut_rows(&bindings, Modifiers::default(), "term");
         assert_eq!(
             rows.iter()
-                .map(|row| row.action.as_str())
+                .map(|row| row.binding.action.as_str())
                 .collect::<Vec<_>>(),
             [
                 "Term",
@@ -2271,9 +2374,123 @@ mod tests {
         );
         assert!(rows[0].label < rows[1].label);
         assert_eq!(
-            shortcut_rows(&bindings, Modifiers::default(), "ÜBR ÖFN")[0].action,
+            shortcut_rows(&bindings, Modifiers::default(), "ÜBR ÖFN")[0]
+                .binding
+                .action,
             "Über öffnen"
         );
+    }
+
+    #[test]
+    fn search_selects_the_first_ranked_binding_and_tracks_filter_changes() {
+        let mut state = fixture_state(KeyboardLayout::Tkl, false, false);
+        state.snapshot.bindings = crate::core::parse_bindings(
+            "SUPER + A → Open terminal\nALT + B → Term\nSUPER + C → Terminal",
+        );
+        for (index, binding) in state.snapshot.bindings.iter_mut().enumerate() {
+            binding.dispatcher = "exec".into();
+            binding.arg = format!("command-{index}");
+        }
+        state.modifiers = Modifiers::default();
+        assert!(state.selected_shortcut().is_none());
+        state.set_query("term".into());
+        assert_eq!(state.selected_shortcut().unwrap().arg, "command-1");
+        state.modifiers = Modifiers::SUPER;
+        assert_eq!(state.selected_shortcut().unwrap().arg, "command-2");
+        state.set_query("open term".into());
+        assert_eq!(state.selected_shortcut().unwrap().arg, "command-0");
+        for query in ["zzzz", "   ", ""] {
+            state.set_query(query.into());
+            assert!(state.selected_shortcut().is_none());
+        }
+    }
+
+    #[test]
+    fn search_navigation_wraps_and_typing_resets_the_selected_command() {
+        let mut state = fixture_state(KeyboardLayout::Tkl, false, false);
+        state.snapshot.bindings = crate::core::parse_bindings(
+            "SUPER + A → Term\nSUPER + B → Terminal\nSUPER + C → Open terminal",
+        );
+        for (index, binding) in state.snapshot.bindings.iter_mut().enumerate() {
+            binding.dispatcher = "exec".into();
+            binding.arg = format!("command-{index}");
+        }
+        state.set_query("term".into());
+        for (key, command) in [
+            (gdk::Key::Up, "command-2"),
+            (gdk::Key::Down, "command-0"),
+            (gdk::Key::Down, "command-1"),
+            (gdk::Key::KP_Down, "command-2"),
+            (gdk::Key::KP_Up, "command-1"),
+        ] {
+            assert!(state.navigate_search(key));
+            assert_eq!(state.selected_shortcut().unwrap().arg, command);
+        }
+        state.set_query("terminal".into());
+        assert_eq!(state.selected_shortcut_index, 0);
+        assert_eq!(state.selected_shortcut().unwrap().arg, "command-1");
+        assert_eq!(state.metrics.search.offset, 0.0);
+        assert!(!state.navigate_search(gdk::Key::Left));
+        state.set_query("open terminal".into());
+        for key in [gdk::Key::Up, gdk::Key::Down] {
+            assert!(state.navigate_search(key));
+            assert_eq!(state.selected_shortcut().unwrap().arg, "command-2");
+        }
+        state.set_query("zzzz".into());
+        for key in [gdk::Key::Up, gdk::Key::Down] {
+            assert!(state.navigate_search(key));
+            assert!(state.selected_shortcut().is_none());
+        }
+        for query in ["", "   "] {
+            state.set_query(query.into());
+            assert!(!state.navigate_search(gdk::Key::Down));
+            assert!(state.selected_shortcut().is_none());
+        }
+    }
+
+    #[test]
+    fn search_navigation_keeps_selection_visible_and_typing_resets_scroll() {
+        let surface = ImageSurface::create(Format::ARgb32, 1280, 720).unwrap();
+        let context = Context::new(&surface).unwrap();
+        let mut state = fixture_state(KeyboardLayout::Tkl, false, true);
+        state.snapshot.bindings = (0..100)
+            .map(|index| Binding {
+                modifiers: Modifiers::SUPER,
+                key: "F24".into(),
+                action: format!("Extra action {index:03}"),
+                ..Default::default()
+            })
+            .collect();
+        state.set_query("Extra".into());
+        draw_overlay(&context, 1280.0, 720.0, &mut state);
+        for (key, selected) in [
+            (gdk::Key::Up, 99),
+            (gdk::Key::Up, 98),
+            (gdk::Key::Down, 99),
+            (gdk::Key::Down, 0),
+        ] {
+            assert!(state.navigate_search(key));
+            draw_overlay(&context, 1280.0, 720.0, &mut state);
+            let viewport = state.metrics.search.rect;
+            let row = state
+                .metrics
+                .rows
+                .iter()
+                .find(|(_, text)| text.contains(&format!("Extra action {selected:03}")))
+                .unwrap();
+            assert!((row.0.height - state.style.row_height()).abs() < 0.001);
+            assert_contains(viewport, row.0);
+            assert_eq!(state.metrics.touchpad.offset, 0.0);
+        }
+        state.navigate_search(gdk::Key::Up);
+        assert!(state.metrics.search.offset > 0.0);
+        state.set_query("Extra action 09".into());
+        draw_overlay(&context, 1280.0, 720.0, &mut state);
+        assert_eq!(
+            state.selected_shortcut().unwrap().action,
+            "Extra action 090"
+        );
+        assert_eq!(state.metrics.search.offset, 0.0);
     }
 
     #[test]
@@ -2286,6 +2503,7 @@ mod tests {
                 modifiers: Modifiers::SUPER,
                 key: "F24".into(),
                 action: format!("Extra action {index:03}"),
+                ..Default::default()
             });
         }
         draw_overlay(&context, 1280.0, 720.0, &mut state);
@@ -2449,6 +2667,7 @@ mod tests {
             modifiers: Modifiers::default(),
             key: "MOUSE_MIDDLE".into(),
             action: "Middle action".into(),
+            ..Default::default()
         });
         draw_overlay(&context, 1920.0, 1080.0, &mut state);
         let panel = state.metrics.mouse;
@@ -2617,6 +2836,7 @@ mod tests {
             held_modifiers: Modifiers::SUPER,
             modifiers: Modifiers::SUPER,
             query: String::new(),
+            selected_shortcut_index: 0,
             hovered: None,
             metrics: RenderMetrics::default(),
         }
@@ -2797,6 +3017,7 @@ mod tests {
                 modifiers: Modifiers::SUPER,
                 key: "MOUSE_LEFT".into(),
                 action: format!("Extra action {index:03}"),
+                ..Default::default()
             });
         }
         state.query = "Extra".into();
@@ -2862,6 +3083,7 @@ mod tests {
                 modifiers: Modifiers::SUPER,
                 key: "MOUSE_LEFT".into(),
                 action: format!("Action {i:03}"),
+                ..Default::default()
             });
         }
         draw_overlay(&context, 1280.0, 720.0, &mut state);
@@ -2961,7 +3183,7 @@ mod tests {
                     "A keyboard with an unusually long manufacturer and model name".repeat(3);
                 for index in 0..100 {
                     state.snapshot.bindings.push(Binding { modifiers: Modifiers::SUPER,
-                        key: "MOUSE_LEFT".into(), action: format!("{index}: A very long action containing WWWWW and unicode 漢字 to exercise fitting") });
+                        key: "MOUSE_LEFT".into(), action: format!("{index}: A very long action containing WWWWW and unicode 漢字 to exercise fitting"), ..Default::default() });
                 }
             }
             if name == "portrait-search" {
@@ -2983,6 +3205,7 @@ mod tests {
                     modifiers: Modifiers::ALT,
                     key: "F24".into(),
                     action: "Unmatched shortcut".into(),
+                    ..Default::default()
                 });
             }
             draw_overlay(&context, width as f64, height as f64, &mut state);

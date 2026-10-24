@@ -100,11 +100,13 @@ impl Modifiers {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Binding {
     pub modifiers: Modifiers,
     pub key: String,
     pub action: String,
+    pub dispatcher: String,
+    pub arg: String,
 }
 
 pub fn parse_bindings(output: &str) -> Vec<Binding> {
@@ -127,6 +129,7 @@ fn parse_binding_line(line: &str) -> Option<Binding> {
         modifiers: Modifiers::from_words(modifier_words),
         key: normalize_key(key),
         action: action.to_string(),
+        ..Default::default()
     })
 }
 

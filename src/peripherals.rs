@@ -522,11 +522,13 @@ mod tests {
                 modifiers: Modifiers::SUPER,
                 key: "MOUSE_UP".into(),
                 action: "Previous workspace".into(),
+                ..Default::default()
             },
             Binding {
                 modifiers: Modifiers::SUPER,
                 key: "MOUSE:275".into(),
                 action: "Extra".into(),
+                ..Default::default()
             },
         ];
         let rows = touchpad_rows(&devices, &bindings);

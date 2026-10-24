@@ -180,10 +180,50 @@ fn add_hyprland_binding(
         modifiers,
         key: normalize_key(&key),
         action,
+        dispatcher: record.dispatcher,
+        arg: record.arg,
     };
 
     if !is_obvious_labeled_binding(&binding) && !bindings.contains(&binding) {
         bindings.push(binding);
+    }
+}
+
+fn binding_command(binding: &Binding) -> Result<Command, String> {
+    let mut command = Command::new("hyprctl");
+    match binding.dispatcher.as_str() {
+        "" => return Err("Shortcut has no registered command".into()),
+        "__lua" => {
+            // Hyprland stores Lua binding callbacks as Lua registry references.
+            let reference = binding
+                .arg
+                .parse::<u32>()
+                .ok()
+                .filter(|reference| *reference > 0)
+                .ok_or("Shortcut has an invalid Lua callback reference")?;
+            command.arg("eval").arg(format!(
+                "local callback = debug.getregistry()[{reference}]; assert(type(callback) == 'function', 'Shortcut callback is no longer available'); callback()"
+            ));
+        }
+        dispatcher => {
+            command.args(["dispatch", "--", dispatcher, &binding.arg]);
+        }
+    }
+    Ok(command)
+}
+
+pub fn execute_binding(binding: &Binding) -> Result<(), String> {
+    let output = binding_command(binding)?
+        .output()
+        .map_err(|error| format!("Could not execute shortcut: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not execute shortcut: {} {}",
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 }
 
@@ -385,6 +425,58 @@ mod tests {
     }
 
     #[test]
+    fn commands_preserve_registered_dispatchers_and_arguments() {
+        for (dispatcher, arg) in [
+            ("exec", "terminal --title 'A; B' -e sh -c 'echo $HOME'"),
+            ("workspace", "+1"),
+            ("killactive", ""),
+            ("exec", "--flag"),
+        ] {
+            let bindings = parse_hyprland_bindings(
+                &format!(
+                    "bind\n\tmodmask: 64\n\tkey: T\n\tdescription: Action\n\tdispatcher: {dispatcher}\n\targ: {arg}\n"
+                ),
+                &[],
+            );
+            let command = binding_command(&bindings[0]).unwrap();
+            assert_eq!(command.get_program(), "hyprctl");
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                ["dispatch", "--", dispatcher, arg]
+            );
+        }
+    }
+
+    #[test]
+    fn lua_commands_invoke_only_valid_registry_references() {
+        let mut binding = Binding {
+            dispatcher: "__lua".into(),
+            arg: "71".into(),
+            ..Default::default()
+        };
+        let command = binding_command(&binding).unwrap();
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args[0], "eval");
+        assert!(
+            args[1]
+                .to_str()
+                .unwrap()
+                .contains("debug.getregistry()[71]")
+        );
+        assert!(
+            args[1]
+                .to_str()
+                .unwrap()
+                .contains("type(callback) == 'function'")
+        );
+        for arg in ["", "0", "-1", "71]; os.execute('anything')"] {
+            binding.arg = arg.into();
+            assert!(binding_command(&binding).is_err());
+        }
+        assert!(binding_command(&Binding::default()).is_err());
+    }
+
+    #[test]
     fn parses_live_hyprland_records_and_recovers_lua_code_keys() {
         let supplements = parse_bindings(
             "SUPER + 1 → Switch to workspace 1\n\
@@ -432,6 +524,8 @@ bind
                 modifiers: Modifiers::SUPER,
                 key: "1".into(),
                 action: "Switch to workspace 1".into(),
+                dispatcher: "__lua".into(),
+                arg: "71".into(),
             }
         );
         assert_eq!(bindings[1].key, "MOUSE_LEFT");

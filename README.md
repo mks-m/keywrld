@@ -65,13 +65,16 @@ The separate search panel initially lists all registered keyboard and mouse
 bindings across every modifier combination, including keys absent from the
 detected layout. Type immediately to fuzzy-search action descriptions, key
 names, and modifier labels. Each word narrows the results; exact and contiguous
-matches appear before scattered matches.
+matches appear before scattered matches. The first result is selected when the
+search text changes. Use Up/Down to select another result, wrapping at either end;
+the list scrolls to keep it visible. Press Enter to close the overlay and execute
+its command. Empty searches and searches without matches do not execute anything.
 
 Holding or latching modifiers filters the list to that exact combination.
 Releasing held modifiers and clearing latched modifiers restores all combinations.
 Clear the search field to remove the text filter. Scroll over the results
 independently of the touchpad panel, and hover a row for its full chord and
-description. Results provide shortcut help; clicking them does not run actions.
+description. Clicking results does not run actions.
 In landscape layouts, search stays outermost left when the mouse diagram is also on the left.
 
 ## Appearance
