@@ -198,7 +198,13 @@ pub fn normalize_key(key: &str) -> String {
 pub fn is_mouse_key(key: &str) -> bool {
     matches!(
         key,
-        "MOUSE_DOWN" | "MOUSE_UP" | "MOUSE_LEFT" | "MOUSE_RIGHT" | "MOUSE_MIDDLE" | "MOUSE_SCROLL_LEFT" | "MOUSE_SCROLL_RIGHT"
+        "MOUSE_DOWN"
+            | "MOUSE_UP"
+            | "MOUSE_LEFT"
+            | "MOUSE_RIGHT"
+            | "MOUSE_MIDDLE"
+            | "MOUSE_SCROLL_LEFT"
+            | "MOUSE_SCROLL_RIGHT"
     ) || key.starts_with("MOUSE:")
 }
 
@@ -586,96 +592,6 @@ fn build_geometry(layout: KeyboardLayout) -> KeyboardGeometry {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Color {
-    pub red: f64,
-    pub green: f64,
-    pub blue: f64,
-    pub alpha: f64,
-}
-
-impl Color {
-    pub const fn rgb(red: u8, green: u8, blue: u8) -> Self {
-        Self {
-            red: red as f64 / 255.0,
-            green: green as f64 / 255.0,
-            blue: blue as f64 / 255.0,
-            alpha: 1.0,
-        }
-    }
-
-    pub const fn with_alpha(self, alpha: f64) -> Self {
-        Self { alpha, ..self }
-    }
-
-    fn from_hex(value: &str) -> Option<Self> {
-        let value = value.trim().trim_matches('"').strip_prefix('#')?;
-        if value.len() != 6 {
-            return None;
-        }
-        let red = u8::from_str_radix(&value[0..2], 16).ok()?;
-        let green = u8::from_str_radix(&value[2..4], 16).ok()?;
-        let blue = u8::from_str_radix(&value[4..6], 16).ok()?;
-        Some(Self::rgb(red, green, blue))
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Palette {
-    pub background: Color,
-    pub darker_background: Color,
-    pub lighter_background: Color,
-    pub foreground: Color,
-    pub dark_foreground: Color,
-    pub accent: Color,
-    pub selection: Color,
-    pub muted: Color,
-    pub red: Color,
-}
-
-impl Default for Palette {
-    fn default() -> Self {
-        Self {
-            background: Color::rgb(26, 27, 38),
-            darker_background: Color::rgb(14, 14, 20),
-            lighter_background: Color::rgb(36, 40, 59),
-            foreground: Color::rgb(192, 202, 245),
-            dark_foreground: Color::rgb(86, 95, 137),
-            accent: Color::rgb(122, 162, 247),
-            selection: Color::rgb(41, 46, 66),
-            muted: Color::rgb(65, 72, 104),
-            red: Color::rgb(247, 118, 142),
-        }
-    }
-}
-
-impl Palette {
-    pub fn from_toml(input: &str) -> Self {
-        let mut palette = Self::default();
-        for line in input.lines() {
-            let Some((name, value)) = line.split_once('=') else {
-                continue;
-            };
-            let Some(color) = Color::from_hex(value) else {
-                continue;
-            };
-            match name.trim() {
-                "background" => palette.background = color,
-                "darker_background" => palette.darker_background = color,
-                "lighter_background" => palette.lighter_background = color,
-                "foreground" | "bright_foreground" => palette.foreground = color,
-                "dark_foreground" => palette.dark_foreground = color,
-                "accent" => palette.accent = color,
-                "selection" => palette.selection = color,
-                "muted" => palette.muted = color,
-                "red" => palette.red = color,
-                _ => {}
-            }
-        }
-        palette
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,7 +643,10 @@ mod tests {
         assert_eq!(normalize_key("mouse_left"), "MOUSE_SCROLL_LEFT");
         assert_eq!(normalize_key("mouse_right"), "MOUSE_SCROLL_RIGHT");
         assert_eq!(normalize_key(&normalize_key("mouse:272")), "MOUSE_LEFT");
-        assert_eq!(normalize_key(&normalize_key("mouse_left")), "MOUSE_SCROLL_LEFT");
+        assert_eq!(
+            normalize_key(&normalize_key("mouse_left")),
+            "MOUSE_SCROLL_LEFT"
+        );
         assert!(!is_mouse_key("UP"));
     }
 
@@ -774,12 +693,5 @@ mod tests {
                 .iter()
                 .all(|key| !key.rect.contains(100.0, 100.0))
         );
-    }
-
-    #[test]
-    fn theme_parser_keeps_fallbacks_for_missing_colors() {
-        let palette = Palette::from_toml("accent = \"#010203\"\nbackground = invalid");
-        assert_eq!(palette.accent, Color::rgb(1, 2, 3));
-        assert_eq!(palette.background, Palette::default().background);
     }
 }

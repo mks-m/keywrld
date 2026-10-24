@@ -1,14 +1,14 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use crate::peripherals::{PointingDevices, discover_pointing_devices};
 use serde_json::Value;
 
 use crate::core::{
-    Binding, DeviceCandidate, KeyboardLayout, Modifiers, Palette, detect_keyboard_layout,
-    normalize_key, parse_bindings,
+    Binding, DeviceCandidate, KeyboardLayout, Modifiers, detect_keyboard_layout, normalize_key,
+    parse_bindings,
 };
 
 #[derive(Clone, Debug)]
@@ -18,7 +18,6 @@ pub struct RuntimeSnapshot {
     pub layout: KeyboardLayout,
     pub device_name: String,
     pub monitor_connector: Option<String>,
-    pub palette: Palette,
     pub pointing: PointingDevices,
 }
 
@@ -38,7 +37,6 @@ pub fn load_runtime(layout_override: Option<KeyboardLayout>) -> RuntimeSnapshot 
         layout,
         device_name,
         monitor_connector: active_monitor_connector(),
-        palette: load_palette(),
         pointing: discover_pointing_devices(registry.as_ref()),
     }
 }
@@ -196,24 +194,6 @@ fn is_obvious_labeled_binding(binding: &Binding) -> bool {
                 binding.key.as_str(),
                 "PRINT" | "SCROLLLOCK" | "PAUSE" | "NUMLOCK" | "CAPSLOCK"
             ))
-}
-
-fn load_palette() -> Palette {
-    let Some(home) = std::env::var_os("HOME") else {
-        return Palette::default();
-    };
-    let state_root = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(home).join(".local/state"));
-    let path = state_root
-        .join("omarchy")
-        .join("current")
-        .join("theme")
-        .join("colors.toml");
-
-    fs::read_to_string(path)
-        .map(|contents| Palette::from_toml(&contents))
-        .unwrap_or_default()
 }
 
 fn active_monitor_connector() -> Option<String> {

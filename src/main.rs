@@ -1,7 +1,7 @@
 mod core;
 mod icons;
 mod peripherals;
-mod search_style;
+mod style;
 mod system;
 mod ui;
 

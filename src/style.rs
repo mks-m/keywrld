@@ -1,13 +1,36 @@
-//! Search-only styling. Read desktop settings without changing global GTK state.
+//! Shared overlay styling. Read desktop settings without changing global GTK state.
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
 };
 
-use crate::core::{Color, Palette};
 use gtk4::{gdk, prelude::*};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Color {
+    pub red: f64,
+    pub green: f64,
+    pub blue: f64,
+    pub alpha: f64,
+}
+
+impl Color {
+    pub const fn rgb(red: u8, green: u8, blue: u8) -> Self {
+        Self {
+            red: red as f64 / 255.0,
+            green: green as f64 / 255.0,
+            blue: blue as f64 / 255.0,
+            alpha: 1.0,
+        }
+    }
+
+    pub const fn with_alpha(self, alpha: f64) -> Self {
+        Self { alpha, ..self }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ControlStyle {
@@ -17,7 +40,13 @@ pub struct ControlStyle {
 }
 
 #[derive(Clone, Debug)]
-pub struct SearchStyle {
+pub struct Style {
+    pub scrim: Color,
+    pub darker_background: Color,
+    pub lighter_background: Color,
+    pub muted: Color,
+    pub red: Color,
+    pub selected: ControlStyle,
     pub background: Color,
     pub foreground: Color,
     pub secondary: Color,
@@ -40,30 +69,44 @@ pub struct SearchStyle {
     pub row_padding_x: f64,
 }
 
-impl Default for SearchStyle {
+impl Default for Style {
     fn default() -> Self {
-        let p = Palette::default();
+        let background = Color::rgb(26, 27, 38);
+        let foreground = Color::rgb(192, 202, 245);
+        let accent = Color::rgb(122, 162, 247);
+        let muted = Color::rgb(65, 72, 104);
+        let selection = Color::rgb(41, 46, 66);
         Self {
-            background: p.background,
-            foreground: p.foreground,
-            secondary: p.dark_foreground,
-            accent: p.accent,
-            border: p.muted,
+            scrim: background.with_alpha(0.5),
+            darker_background: Color::rgb(14, 14, 20),
+            lighter_background: Color::rgb(36, 40, 59),
+            muted,
+            red: Color::rgb(247, 118, 142),
+            selected: ControlStyle {
+                fill: selection,
+                border: accent,
+                width: 1.0,
+            },
+            background,
+            foreground,
+            secondary: Color::rgb(86, 95, 137),
+            accent,
+            border: muted,
             border_width: 1.0,
             radius: 7.0,
             controls: [ControlStyle {
-                fill: p.darker_background,
-                border: p.muted,
+                fill: Color::rgb(14, 14, 20),
+                border: muted,
                 width: 1.0,
             }; 3],
-            selection: p.selection,
-            selected_text: p.foreground,
+            selection,
+            selected_text: foreground,
             row_hover: ControlStyle {
-                fill: p.selection,
-                border: p.accent,
+                fill: selection,
+                border: accent,
                 width: 1.0,
             },
-            row_hover_text: p.foreground,
+            row_hover_text: foreground,
             font: "sans".into(),
             body: 12.0,
             caption: 10.0,
@@ -76,7 +119,7 @@ impl Default for SearchStyle {
     }
 }
 
-// Only scalar values used by search are read; this does not execute theme/config code.
+// Only the scalar shell tokens used by the overlay are read; this does not execute theme/config code.
 #[derive(Default)]
 struct Values(BTreeMap<String, String>);
 impl Values {
@@ -127,7 +170,9 @@ impl Values {
             .filter(|n| n.is_finite() && *n >= 0.0)
     }
     fn color(&self, key: &str, palette: &Values) -> Option<Color> {
-        let mut value = self.value(key)?;
+        self.resolve_color(self.value(key)?, palette)
+    }
+    fn resolve_color<'a>(&'a self, mut value: &'a str, palette: &'a Values) -> Option<Color> {
         for _ in 0..8 {
             if let Some(c) = parse_color(value) {
                 return Some(c);
@@ -139,6 +184,53 @@ impl Values {
     fn alpha(&self, key: &str, fallback: f64) -> f64 {
         self.number(key).unwrap_or(fallback).clamp(0.0, 1.0)
     }
+}
+
+fn resolved_colors(directory: &Path) -> Option<Values> {
+    let file = directory.join("colors.toml");
+    let input = fs::read_to_string(&file).ok()?;
+    // Omarchy's line reader skips a final line without a newline. Normalize
+    // only those files in a temporary copy; leave the installed theme alone.
+    let temporary = if input.ends_with('\n') {
+        None
+    } else {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "keywrld-colors-{}-{stamp}.toml",
+            std::process::id()
+        ));
+        let mut file = fs::File::create_new(&path).ok()?;
+        if writeln!(file, "{input}").is_err() {
+            let _ = fs::remove_file(&path);
+            return None;
+        }
+        Some(path)
+    };
+    let output = Command::new("omarchy")
+        .args(["theme", "color", "--all", "--file"])
+        .arg(temporary.as_deref().unwrap_or(&file))
+        .output();
+    if let Some(path) = temporary {
+        let _ = fs::remove_file(path);
+    }
+    let output = output.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let values = String::from_utf8(output.stdout).ok()?;
+    let values = Values(
+        values
+            .lines()
+            .filter_map(|line| {
+                let (key, value) = line.split_once('\t')?;
+                Some((key.to_owned(), value.to_owned()))
+            })
+            .collect(),
+    );
+    (!values.0.is_empty()).then_some(values)
 }
 
 fn parse_color(value: &str) -> Option<Color> {
@@ -214,7 +306,7 @@ fn hypr_option(name: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&output.stdout).ok()
 }
 
-impl SearchStyle {
+impl Style {
     pub fn load(widget: &impl IsA<gtk4::Widget>) -> Self {
         let context = widget.style_context();
         let color = |names: &[&str]| {
@@ -273,21 +365,31 @@ impl SearchStyle {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
         let theme = root.map(|p| p.join("omarchy/current/theme"));
-        Self::read_theme(theme.as_deref(), desktop)
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .map(|p| p.join("omarchy/shell.toml"));
+        Self::read_theme(theme.as_deref(), config.as_deref(), desktop)
     }
 
-    fn read_theme(directory: Option<&Path>, desktop: Desktop) -> Self {
+    fn read_theme(directory: Option<&Path>, user_shell: Option<&Path>, desktop: Desktop) -> Self {
         let read = |file| {
             directory
                 .and_then(|p| fs::read_to_string(p.join(file)).ok())
                 .unwrap_or_default()
         };
-        Self::resolve(&read("colors.toml"), &read("shell.toml"), desktop)
+        let colors = directory
+            .and_then(resolved_colors)
+            .unwrap_or_else(|| Values::parse(&read("colors.toml")));
+        let mut shell = Values::parse(&read("shell.toml"));
+        if let Some(user) = user_shell.and_then(|p| fs::read_to_string(p).ok()) {
+            shell.0.extend(Values::parse(&user).0);
+        }
+        Self::resolve(colors, shell, desktop)
     }
 
-    fn resolve(colors: &str, shell: &str, desktop: Desktop) -> Self {
-        let p = Values::parse(colors);
-        let s = Values::parse(shell);
+    fn resolve(p: Values, s: Values, desktop: Desktop) -> Self {
         let mut style = Self::default();
         if p.0.is_empty()
             && s.0.is_empty()
@@ -304,25 +406,37 @@ impl SearchStyle {
         }
         let pc = |keys: &[&str]| keys.iter().find_map(|k| p.color(k, &p));
         let sc = |key: &str| s.color(key, &p);
-        let omarchy = pc(&["background", "foreground", "bg", "fg"]).is_some()
-            || sc("menu.background").is_some();
+        let omarchy =
+            pc(&["background", "foreground"]).is_some() || sc("menu.background").is_some();
         style.background = opacity(
             sc("menu.background")
-                .or_else(|| pc(&["background", "bg", "color0"]))
+                .or_else(|| pc(&["background"]))
                 .or(desktop.background)
                 .unwrap_or(style.background),
             s.alpha("menu.background-alpha", 1.0),
         );
         style.foreground = sc("menu.text")
-            .or_else(|| pc(&["foreground", "fg", "bright_foreground", "color7"]))
+            .or_else(|| pc(&["foreground", "bright_foreground"]))
             .or(desktop.foreground)
             .unwrap_or(style.foreground);
-        style.accent = pc(&["accent", "blue", "color4"])
+        style.accent = pc(&["accent", "blue"])
             .or(desktop.border)
             .or(desktop.accent)
             .unwrap_or(style.accent);
-        style.secondary = pc(&["dark_foreground", "dark_fg"])
+        style.secondary = pc(&["dark_foreground"])
             .unwrap_or_else(|| mix(style.background, style.foreground, 0.65));
+        style.darker_background = pc(&["darker_background"])
+            .unwrap_or_else(|| mix(style.background, style.foreground, 0.03));
+        style.lighter_background = pc(&["lighter_background"])
+            .unwrap_or_else(|| mix(style.background, style.foreground, 0.08));
+        style.muted = pc(&["muted"]).unwrap_or(style.secondary);
+        style.red = pc(&["red"]).unwrap_or(style.accent);
+        style.scrim = opacity(
+            sc("menu.scrim")
+                .or_else(|| pc(&["background"]))
+                .unwrap_or(style.background.with_alpha(1.0)),
+            s.alpha("menu.scrim-alpha", 0.5),
+        );
         style.border = opacity(
             sc("menu.border")
                 .or(desktop.border)
@@ -364,63 +478,63 @@ impl SearchStyle {
         style.padding_y = s.number("spacing.input-padding-y").unwrap_or(7.0 * scale);
         style.row_gap = s.number("spacing.row-gap").unwrap_or(8.0 * scale);
         style.row_padding_x = s.number("spacing.row-padding-x").unwrap_or(12.0 * scale);
-        for (index, state) in ["normal", "hover-cursor", "focus"].iter().enumerate() {
-            let key = |suffix| format!("controls.{state}-{suffix}");
-            let color = sc(&key("color"))
-                .or_else(|| {
+        let state_color = |value: &str| match value {
+            "foreground" | "text" => Some(style.foreground),
+            "accent" => Some(style.accent),
+            "urgent" => Some(style.red),
+            _ => s.resolve_color(value, &p),
+        };
+        for (index, state) in ["normal", "hover-cursor", "focus", "selected"]
+            .iter()
+            .enumerate()
+        {
+            let key = |suffix: &str| format!("controls.{state}-{suffix}");
+            let inherited = |suffix: &str| {
+                s.value(&key(suffix)).or_else(|| {
                     if index == 2 {
-                        sc("controls.hover-cursor-color")
+                        s.value(&format!("controls.hover-cursor-{suffix}"))
                     } else {
                         None
                     }
                 })
+            };
+            let color = inherited("color")
+                .and_then(state_color)
                 .unwrap_or(style.foreground);
-            let inherited = style.controls[if index == 2 { 1 } else { 0 }];
-            style.controls[index] = ControlStyle {
+            let border = inherited("border").and_then(state_color).unwrap_or(color);
+            let number = |suffix: &str, fallback: f64| {
+                inherited(suffix)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|n| n.is_finite() && *n >= 0.0)
+                    .unwrap_or(fallback)
+            };
+            let control = ControlStyle {
                 fill: opacity(
                     color,
-                    s.alpha(
-                        &key("fill-alpha"),
-                        if index == 2 {
-                            inherited.fill.alpha
-                        } else if index == 0 {
-                            0.04
-                        } else {
-                            0.08
-                        },
-                    ),
+                    number("fill-alpha", [0.04, 0.08, 0.08, 0.18][index]).clamp(0.0, 1.0),
                 ),
                 border: opacity(
-                    sc(&key("border"))
-                        .or_else(|| {
-                            if index == 2 {
-                                sc("controls.hover-cursor-border")
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(color),
-                    s.alpha(
-                        &key("border-alpha"),
-                        if index == 2 {
-                            inherited.border.alpha
-                        } else if index == 0 {
-                            0.4
-                        } else {
-                            0.25
-                        },
-                    ),
+                    border,
+                    number("border-alpha", [0.4, 0.25, 0.25, 1.0][index]).clamp(0.0, 1.0),
                 ),
-                width: s.number(&key("border-width")).unwrap_or(if index == 0 {
-                    1.0
-                } else {
-                    inherited.width
-                }),
+                width: number(
+                    "border-width",
+                    if index == 3 {
+                        0.0
+                    } else {
+                        style.controls[if index == 2 { 1 } else { 0 }].width
+                    },
+                ),
             };
+            if index == 3 {
+                style.selected = control;
+            } else {
+                style.controls[index] = control;
+            }
         }
         style.selection = if omarchy {
             opacity(
-                style.foreground,
+                sc("controls.selection-color").unwrap_or(style.foreground),
                 s.alpha("controls.selection-fill-alpha", 0.35),
             )
         } else {
@@ -444,6 +558,23 @@ impl SearchStyle {
         };
         style.row_hover_text = sc("menu.selected-text").unwrap_or(style.accent);
         style
+    }
+
+    #[cfg(test)]
+    pub fn from_theme(colors: &str, shell: &str) -> Self {
+        Self::resolve(
+            Values::parse(colors),
+            Values::parse(shell),
+            Desktop::default(),
+        )
+    }
+
+    pub fn panel(&self) -> ControlStyle {
+        ControlStyle {
+            fill: self.background,
+            border: self.border,
+            width: self.border_width,
+        }
     }
 
     pub fn entry_height(&self) -> f64 {
@@ -496,10 +627,13 @@ impl SearchStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn resolve(colors: &str, shell: &str, desktop: Desktop) -> Style {
+        Style::resolve(Values::parse(colors), Values::parse(shell), desktop)
+    }
     #[test]
     fn opening_rereads_theme_files_and_missing_files_use_defaults() {
         let directory = std::env::temp_dir().join(format!(
-            "keywrld-search-{}-{}",
+            "keywrld-style-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -507,12 +641,27 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir(&directory).unwrap();
-        let read = || SearchStyle::read_theme(Some(&directory), Desktop::default());
-        assert_eq!(read().background, SearchStyle::default().background);
+        let read = || Style::read_theme(Some(&directory), None, Desktop::default());
+        assert_eq!(read().background, Style::default().background);
         fs::write(directory.join("colors.toml"), "foreground = '#112233'").unwrap();
         assert_eq!(read().foreground, Color::rgb(17, 34, 51));
         fs::write(directory.join("colors.toml"), "foreground = '#abcdef'").unwrap();
         assert_eq!(read().foreground, Color::rgb(171, 205, 239));
+        fs::write(
+            directory.join("shell.toml"),
+            "[font]\nbase-size = 12\n[menu]\ntext = '#223344'",
+        )
+        .unwrap();
+        let user = directory.join("user.toml");
+        fs::write(&user, "[font]\nbase-size = 20\n[menu]\nborder-width = 3").unwrap();
+        let style = Style::read_theme(Some(&directory), Some(&user), Desktop::default());
+        assert_eq!(style.body, 20.0);
+        assert_eq!(style.border_width, 3.0);
+        assert_eq!(style.foreground, Color::rgb(34, 51, 68));
+        fs::write(&user, "[font]\nbase-size = 16").unwrap();
+        let style = Style::read_theme(Some(&directory), Some(&user), Desktop::default());
+        assert_eq!(style.body, 16.0);
+        assert_eq!(style.border_width, Style::default().border_width);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -522,10 +671,10 @@ mod tests {
             "foreground = '#123456'\nbright_foreground = '#ffffff'",
             "bright_foreground = '#ffffff'\nforeground = '#123456'",
         ] {
-            let style = SearchStyle::resolve(colors, "", Desktop::default());
+            let style = resolve(colors, "", Desktop::default());
             assert_eq!(style.foreground, Color::rgb(18, 52, 86));
             assert_eq!(style.font, "monospace");
-            let style = SearchStyle::resolve(
+            let style = resolve(
                 colors,
                 "[menu]\ntext = '#abcdef' # comment",
                 Desktop::default(),
@@ -535,7 +684,7 @@ mod tests {
     }
     #[test]
     fn partial_invalid_and_missing_sources_fall_through() {
-        let style = SearchStyle::resolve(
+        let style = resolve(
             "background = 'invalid'\nforeground = '#010203'",
             "[font]\nbase-size = nan\n[menu]\nborder-width = -2",
             Desktop {
@@ -549,7 +698,7 @@ mod tests {
         assert_eq!(style.border_width, 2.0);
         assert_eq!(style.radius, 0.0);
         assert_eq!(style.body, 12.0);
-        let style = SearchStyle::resolve(
+        let style = resolve(
             "",
             "",
             Desktop {
@@ -559,12 +708,44 @@ mod tests {
         );
         assert_eq!(style.body, 16.0);
         assert_eq!(style.font, "Example Sans");
-        let style = SearchStyle::resolve("", "", Desktop::default());
-        assert_eq!(style.background, SearchStyle::default().background);
+        let style = resolve("", "", Desktop::default());
+        assert_eq!(style.background, Style::default().background);
     }
     #[test]
+    fn controls_share_surface_roles_and_focus_inherits_hover_without_compounding_alpha() {
+        let style = Style::from_theme(
+            "foreground = '#123456'",
+            "[menu]\ntext = '#abcdef'\n[controls]\nhover-cursor-color = 'rgba(11223380)'\nhover-cursor-fill-alpha = 0.4\nhover-cursor-border-width = 3\nselected-color = 'foreground'\nselected-fill-alpha = 0.6\nselected-border-width = 0",
+        );
+        assert_eq!(style.controls[1].fill, style.controls[2].fill);
+        assert!((style.controls[2].fill.alpha - 128.0 / 255.0 * 0.4).abs() < 1e-9);
+        assert_eq!(style.controls[2].width, 3.0);
+        assert_eq!(style.selected.fill, style.foreground.with_alpha(0.6));
+        assert_eq!(style.selected.width, 0.0);
+    }
+
+    #[test]
+    #[ignore = "requires Omarchy's shared semantic color resolver"]
+    fn omarchy_resolves_legacy_palettes_and_derives_missing_shades() {
+        let directory =
+            std::env::temp_dir().join(format!("keywrld-resolver-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("colors.toml"), "bg = '#eeeeee'\nfg = '#222222'\ncolor4 = '#123456'\nred = '#ff0000'\nyellow = '#ffff00'").unwrap();
+        let style = Style::resolve(
+            resolved_colors(&directory).expect("Omarchy color resolver"),
+            Values::default(),
+            Desktop::default(),
+        );
+        assert_eq!(style.background, Color::rgb(238, 238, 238));
+        assert_eq!(style.foreground, Color::rgb(34, 34, 34));
+        assert_eq!(style.accent, Color::rgb(18, 52, 86));
+        assert_eq!(style.darker_background, Color::rgb(119, 119, 119));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn shell_references_alpha_and_hyprland_gradient() {
-        let style = SearchStyle::resolve(
+        let style = resolve(
             "foreground = '#abcdef'",
             "[hyprland]\nactive-border = '#112233'\n[menu]\nborder = 'hyprland.active-border'\nbackground-alpha = 0.8\n[controls]\nfocus-border-width = 2\n[font]\nbase-size = 18",
             Desktop {

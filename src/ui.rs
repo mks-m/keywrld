@@ -9,12 +9,11 @@ use gtk4 as gtk;
 use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell};
 
 use crate::core::{
-    Color, KeyboardGeometry, KeyboardLayout, Modifiers, Palette, Rect, actions_for, chord_label,
-    is_mouse_key,
+    KeyboardGeometry, KeyboardLayout, Modifiers, Rect, actions_for, chord_label, is_mouse_key,
 };
 use crate::icons::{ActionIcon, IconAtlas, icons_for_actions, with_icon_atlas};
 use crate::peripherals::{PeripheralRow, touchpad_rows};
-use crate::search_style::{ControlStyle, SearchStyle};
+use crate::style::{Color, ControlStyle, Style};
 use crate::system::{RuntimeSnapshot, load_runtime};
 
 #[derive(Clone, Debug)]
@@ -63,7 +62,7 @@ impl RenderMetrics {
 }
 
 struct OverlayState {
-    search_style: SearchStyle,
+    style: Style,
     native_entry: bool,
     snapshot: RuntimeSnapshot,
     geometry: KeyboardGeometry,
@@ -149,9 +148,9 @@ fn build_window(
     }
     select_monitor(&window, snapshot.monitor_connector.as_deref());
 
-    let search_style = SearchStyle::load(&window);
+    let style = Style::load(&window);
     let provider = gtk::CssProvider::new();
-    provider.load_from_data(&search_style.css());
+    provider.load_from_data(&style.css());
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
@@ -172,7 +171,7 @@ fn build_window(
     }
 
     let state = Rc::new(RefCell::new(OverlayState {
-        search_style,
+        style,
         native_entry: true,
         geometry: KeyboardGeometry::new(snapshot.layout),
         snapshot,
@@ -353,7 +352,7 @@ fn build_window(
         move |overlay, _| {
             let state = state.borrow();
             let layout = overlay_layout(overlay.width() as f64, overlay.height() as f64, &state);
-            let rect = search_entry_rect(layout.search, &state.search_style);
+            let rect = search_entry_rect(layout.search, &state.style);
             Some(gdk::Rectangle::new(
                 rect.x.round() as i32,
                 rect.y.round() as i32,
@@ -488,8 +487,8 @@ fn toggle_latched_modifier(
 }
 
 fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayState) {
-    let palette = state.snapshot.palette;
-    set_source(context, palette.darker_background.with_alpha(0.82));
+    let style = &state.style.clone();
+    set_source(context, style.scrim);
     let _ = context.paint();
 
     let actions = actions_for(&state.snapshot.bindings, state.modifiers);
@@ -536,12 +535,7 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
         });
     }
 
-    rounded_rectangle(context, panel, 18.0);
-    set_source(context, palette.background.with_alpha(0.985));
-    let _ = context.fill_preserve();
-    context.set_line_width(1.0);
-    set_source(context, palette.muted.with_alpha(0.9));
-    let _ = context.stroke();
+    draw_surface(context, panel, style.radius, style.panel());
 
     let content_x = panel.x + outer_padding;
     let board_y = panel.y + outer_padding + header_height;
@@ -554,7 +548,7 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
             width: board_width,
             height: header_height,
         },
-        palette,
+        style,
     );
 
     for hit in layout.keyboard_hits(&state.geometry) {
@@ -572,7 +566,7 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
                 hovered,
                 modifier_active,
                 icon_atlas,
-                palette,
+                style,
             );
         });
         state.metrics.hits.push(hit);
@@ -598,7 +592,7 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
             width: board_width,
             height: detail_height - 10.0,
         },
-        palette,
+        style,
     );
 
     if let Some(panel) = layout.touchpad {
@@ -610,7 +604,7 @@ fn draw_overlay(context: &Context, width: f64, height: f64, state: &mut OverlayS
             &touch_rows,
             &mut state.metrics.touchpad,
             &mut state.metrics.rows,
-            palette,
+            style,
         );
     } else {
         state.metrics.touchpad = ScrollMetrics::default();
@@ -685,7 +679,7 @@ fn overlay_layout(width: f64, height: f64, state: &OverlayState) -> PanelLayout 
     )
 }
 
-fn search_entry_rect(panel: Rect, style: &SearchStyle) -> Rect {
+fn search_entry_rect(panel: Rect, style: &Style) -> Rect {
     Rect {
         x: panel.x + 12.0,
         y: panel.y + 18.0 + style.heading * 1.5,
@@ -754,32 +748,17 @@ fn shortcut_rows(
         .collect()
 }
 
-// Search uses its own font and measured widths; other panels retain their typography.
-fn search_text(
+// Fit themed text using the same font metrics as the renderer.
+fn draw_fitted_text(
     context: &Context,
-    style: &SearchStyle,
+    style: &Style,
     rect: Rect,
     text: &str,
     size: f64,
     weight: FontWeight,
     color: Color,
 ) {
-    context.select_font_face(&style.font, FontSlant::Normal, weight);
-    context.set_font_size(size);
-    let fits = |text: &str| {
-        context
-            .text_extents(text)
-            .is_ok_and(|e| e.x_advance() <= rect.width)
-    };
-    let mut text = text.to_string();
-    if !fits(&text) {
-        while text.pop().is_some() {
-            if fits(&format!("{text}…")) {
-                text.push('…');
-                break;
-            }
-        }
-    }
+    let text = elide_to_width(context, style, text, rect.width, size, weight);
     let _ = context.save();
     context.rectangle(rect.x, rect.y, rect.width.max(0.0), rect.height.max(0.0));
     context.clip();
@@ -793,7 +772,7 @@ fn search_text(
     let _ = context.restore();
 }
 
-fn search_surface(context: &Context, rect: Rect, radius: f64, control: ControlStyle) {
+fn draw_surface(context: &Context, rect: Rect, radius: f64, control: ControlStyle) {
     rounded_rectangle(
         context,
         rect,
@@ -822,18 +801,9 @@ fn search_surface(context: &Context, rect: Rect, radius: f64, control: ControlSt
 }
 
 fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
-    let style = &state.search_style;
-    search_surface(
-        context,
-        panel,
-        style.radius,
-        ControlStyle {
-            fill: style.background,
-            border: style.border,
-            width: style.border_width,
-        },
-    );
-    search_text(
+    let style = &state.style;
+    draw_surface(context, panel, style.radius, style.panel());
+    draw_fitted_text(
         context,
         style,
         Rect {
@@ -850,9 +820,9 @@ fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
     let entry = search_entry_rect(panel, style);
     // Live GTK draws the field. Previews draw the focused field from the same tokens.
     if !state.native_entry {
-        search_surface(context, entry, style.radius, style.controls[2]);
+        draw_surface(context, entry, style.radius, style.controls[2]);
         let inset = style.padding_x + style.controls[2].width;
-        search_text(
+        draw_fitted_text(
             context,
             style,
             Rect {
@@ -874,7 +844,7 @@ fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
                 style.foreground
             },
         );
-        search_text(
+        draw_fitted_text(
             context,
             style,
             Rect {
@@ -897,7 +867,7 @@ fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
     };
     let noun = if rows.len() == 1 { "result" } else { "results" };
     let subtitle_y = entry.y + entry.height + 8.0;
-    search_text(
+    draw_fitted_text(
         context,
         style,
         Rect {
@@ -928,7 +898,7 @@ fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
     context.rectangle(viewport.x, viewport.y, viewport.width, viewport.height);
     context.clip();
     if rows.is_empty() {
-        search_text(
+        draw_fitted_text(
             context,
             style,
             Rect {
@@ -958,7 +928,7 @@ fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
             .pointer
             .is_some_and(|(x, y)| viewport.contains(x, y) && rect.contains(x, y));
         if hovered {
-            search_surface(context, rect, style.radius, style.row_hover);
+            draw_surface(context, rect, style.radius, style.row_hover);
         }
         let text_rect = Rect {
             x: rect.x + style.row_padding_x,
@@ -966,7 +936,7 @@ fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
             width: (rect.width - style.row_padding_x * 2.0).max(0.0),
             height: style.caption * 1.5,
         };
-        search_text(
+        draw_fitted_text(
             context,
             style,
             text_rect,
@@ -975,7 +945,7 @@ fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
             FontWeight::Bold,
             style.accent,
         );
-        search_text(
+        draw_fitted_text(
             context,
             style,
             Rect {
@@ -1013,7 +983,7 @@ fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
             width: 3.0,
             height,
         };
-        search_surface(
+        draw_surface(
             context,
             thumb,
             style.radius.min(1.5),
@@ -1348,22 +1318,8 @@ fn draw_mouse_panel(
     actions: &BTreeMap<String, Vec<String>>,
     state: &mut OverlayState,
 ) {
-    let palette = state.snapshot.palette;
-    rounded_rectangle(context, panel, 16.0);
-    set_source(context, palette.background.with_alpha(0.985));
-    let _ = context.fill_preserve();
-    context.set_line_width(1.0);
-    set_source(context, palette.muted.with_alpha(0.9));
-    let _ = context.stroke();
-    draw_text(
-        context,
-        panel.x + 18.0,
-        panel.y + 29.0,
-        "MOUSE",
-        15.0,
-        FontWeight::Bold,
-        palette.foreground,
-    );
+    let style = &state.style.clone();
+    draw_surface(context, panel, style.radius, style.panel());
     let subtitle = state
         .snapshot
         .pointing
@@ -1371,22 +1327,14 @@ fn draw_mouse_panel(
         .first()
         .map(String::as_str)
         .unwrap_or("Buttons and scroll wheel");
-    draw_text(
-        context,
-        panel.x + 18.0,
-        panel.y + 49.0,
-        &elide(subtitle, ((panel.width - 36.0) / 6.0) as usize),
-        11.0,
-        FontWeight::Normal,
-        palette.dark_foreground,
-    );
+    draw_panel_heading(context, panel, "MOUSE", subtitle, style);
     let (body, controls) = mouse_geometry(panel, keys);
     let cx = body.x + body.width / 2.0;
     // Cable and a rounded shell make the controls read as a mouse, not a grid.
     context.move_to(cx, body.y - 16.0);
     context.line_to(cx, body.y);
     context.set_line_width(2.0);
-    set_source(context, palette.muted);
+    set_source(context, style.muted);
     let _ = context.stroke();
     let top_radius = body.width * 0.2;
     let bottom_radius = body.width * 0.5;
@@ -1409,9 +1357,9 @@ fn draw_mouse_panel(
     context.line_to(body.x, body.y + top_radius);
     context.curve_to(body.x, body.y, body.x, body.y, body.x + top_radius, body.y);
     context.close_path();
-    set_source(context, palette.darker_background.with_alpha(0.65));
+    set_source(context, style.darker_background.with_alpha(0.65));
     let _ = context.fill_preserve();
-    set_source(context, palette.muted);
+    set_source(context, style.muted);
     context.set_line_width(1.5);
     let _ = context.stroke();
 
@@ -1433,9 +1381,9 @@ fn draw_mouse_panel(
         height: down.y + down.height - up.y + 10.0,
     };
     rounded_rectangle(context, housing, housing.width / 2.0);
-    set_source(context, palette.lighter_background);
+    set_source(context, style.lighter_background);
     let _ = context.fill_preserve();
-    set_source(context, palette.muted);
+    set_source(context, style.muted);
     context.set_line_width(1.0);
     let _ = context.stroke();
 
@@ -1446,12 +1394,13 @@ fn draw_mouse_panel(
     };
     draw_text_centered(
         context,
+        style,
         cx,
         body.y + body.height * 0.71,
         &selected,
         (body.width / 18.0).clamp(7.0, 10.0),
         FontWeight::Bold,
-        palette.dark_foreground,
+        style.secondary,
     );
     for hit in &controls {
         let key_actions = actions.get(&hit.key);
@@ -1491,7 +1440,7 @@ fn draw_mouse_panel(
                 hovered,
                 false,
                 atlas,
-                palette,
+                style,
             )
         });
         let _ = context.restore();
@@ -1505,12 +1454,11 @@ fn draw_mouse_panel(
         width: panel.width - 24.0,
         height: 66.0,
     };
-    rounded_rectangle(context, footer, 8.0);
-    set_source(context, palette.darker_background.with_alpha(0.72));
-    let _ = context.fill();
+    draw_surface(context, footer, style.radius, style.controls[0]);
     if let Some(hit) = hovered {
         draw_text(
             context,
+            style,
             footer.x + 10.0,
             footer.y + 18.0,
             &elide(
@@ -1519,7 +1467,7 @@ fn draw_mouse_panel(
             ),
             10.0,
             FontWeight::Bold,
-            palette.accent,
+            style.accent,
         );
         let text = actions
             .get(&hit.key)
@@ -1531,12 +1479,13 @@ fn draw_mouse_panel(
         {
             draw_text(
                 context,
+                style,
                 footer.x + 10.0,
                 footer.y + 35.0 + i as f64 * 14.0,
                 line,
                 10.5,
                 FontWeight::Normal,
-                palette.foreground,
+                style.foreground,
             );
         }
     } else {
@@ -1546,6 +1495,7 @@ fn draw_mouse_panel(
             .count();
         draw_text(
             context,
+            style,
             footer.x + 10.0,
             footer.y + 23.0,
             &if count == 0 {
@@ -1555,19 +1505,58 @@ fn draw_mouse_panel(
             },
             11.0,
             FontWeight::Bold,
-            palette.foreground,
+            style.foreground,
         );
         draw_text(
             context,
+            style,
             footer.x + 10.0,
             footer.y + 43.0,
             "Hover a button or wheel",
             10.5,
             FontWeight::Normal,
-            palette.dark_foreground,
+            style.secondary,
         );
     }
     state.metrics.hits.extend(controls);
+}
+
+fn draw_panel_heading(
+    context: &Context,
+    panel: Rect,
+    title: &str,
+    subtitle: &str,
+    style: &Style,
+) -> f64 {
+    let heading = Rect {
+        x: panel.x + 18.0,
+        y: panel.y + 12.0,
+        width: (panel.width - 36.0).max(0.0),
+        height: 28.0,
+    };
+    draw_fitted_text(
+        context,
+        style,
+        heading,
+        title,
+        style.heading,
+        FontWeight::Bold,
+        style.foreground,
+    );
+    draw_fitted_text(
+        context,
+        style,
+        Rect {
+            y: heading.y + heading.height,
+            height: 18.0,
+            ..heading
+        },
+        subtitle,
+        style.caption,
+        FontWeight::Normal,
+        style.secondary,
+    );
+    panel.y + 62.0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1579,40 +1568,18 @@ fn draw_peripheral_panel(
     rows: &[PeripheralRow],
     scroll: &mut ScrollMetrics,
     row_hits: &mut Vec<(Rect, String)>,
-    palette: Palette,
+    style: &Style,
 ) {
-    rounded_rectangle(context, panel, 16.0);
-    set_source(context, palette.background.with_alpha(0.985));
-    let _ = context.fill_preserve();
-    context.set_line_width(1.0);
-    set_source(context, palette.muted.with_alpha(0.9));
-    let _ = context.stroke();
-    draw_text(
-        context,
-        panel.x + 18.0,
-        panel.y + 29.0,
-        title,
-        15.0,
-        FontWeight::Bold,
-        palette.foreground,
-    );
-    draw_text(
-        context,
-        panel.x + 18.0,
-        panel.y + 49.0,
-        &elide(subtitle, ((panel.width - 36.0) / 6.0) as usize),
-        11.0,
-        FontWeight::Normal,
-        palette.dark_foreground,
-    );
+    draw_surface(context, panel, style.radius, style.panel());
+    let content_y = draw_panel_heading(context, panel, title, subtitle, style);
     let viewport = Rect {
         x: panel.x + 12.0,
-        y: panel.y + 62.0,
+        y: content_y,
         width: panel.width - 24.0,
-        height: (panel.height - 72.0).max(0.0),
+        height: (panel.y + panel.height - 10.0 - content_y).max(0.0),
     };
     scroll.rect = panel;
-    draw_scroll_rows(context, viewport, rows, scroll, row_hits, palette);
+    draw_scroll_rows(context, viewport, rows, scroll, row_hits, style);
 }
 
 fn draw_scroll_rows(
@@ -1621,9 +1588,11 @@ fn draw_scroll_rows(
     rows: &[PeripheralRow],
     scroll: &mut ScrollMetrics,
     row_hits: &mut Vec<(Rect, String)>,
-    palette: Palette,
+    style: &Style,
 ) {
-    scroll.maximum = (rows.len() as f64 * 48.0 - viewport.height).max(0.0);
+    let stride = style.row_height() + style.row_gap;
+    let content_height = (rows.len() as f64 * stride - style.row_gap).max(0.0);
+    scroll.maximum = (content_height - viewport.height).max(0.0);
     scroll.offset = scroll.offset.clamp(0.0, scroll.maximum);
     let _ = context.save();
     context.rectangle(viewport.x, viewport.y, viewport.width, viewport.height);
@@ -1631,45 +1600,41 @@ fn draw_scroll_rows(
     for (index, row) in rows.iter().enumerate() {
         let rect = Rect {
             x: viewport.x,
-            y: viewport.y + index as f64 * 48.0 - scroll.offset,
+            y: viewport.y + index as f64 * stride - scroll.offset,
             width: viewport.width - 8.0,
-            height: 42.0,
+            height: style.row_height(),
         };
         if rect.y + rect.height <= viewport.y || rect.y >= viewport.y + viewport.height {
             continue;
         }
-        rounded_rectangle(context, rect, 7.0);
-        set_source(context, palette.darker_background.with_alpha(0.58));
-        let _ = context.fill();
-        draw_text(
+        draw_surface(context, rect, style.radius, style.controls[0]);
+        let text = Rect {
+            x: rect.x + style.row_padding_x,
+            y: rect.y + style.padding_y,
+            width: (rect.width - style.row_padding_x * 2.0).max(0.0),
+            height: style.caption * 1.5,
+        };
+        draw_fitted_text(
             context,
-            rect.x + 10.0,
-            rect.y + 15.0,
-            &elide_to_width(
-                context,
-                &row.label,
-                rect.width - 20.0,
-                10.0,
-                FontWeight::Bold,
-            ),
-            10.0,
+            style,
+            text,
+            &row.label,
+            style.caption,
             FontWeight::Bold,
-            palette.accent,
+            style.accent,
         );
-        draw_text(
+        draw_fitted_text(
             context,
-            rect.x + 10.0,
-            rect.y + 32.0,
-            &elide_to_width(
-                context,
-                &row.action,
-                rect.width - 20.0,
-                10.5,
-                FontWeight::Normal,
-            ),
-            10.5,
+            style,
+            Rect {
+                y: text.y + text.height,
+                height: style.body * 1.5,
+                ..text
+            },
+            &row.action,
+            style.body,
             FontWeight::Normal,
-            palette.foreground,
+            style.foreground,
         );
         let top = rect.y.max(viewport.y);
         let bottom = (rect.y + rect.height).min(viewport.y + viewport.height);
@@ -1683,7 +1648,7 @@ fn draw_scroll_rows(
         ));
     }
     if scroll.maximum > 0.0 {
-        let thumb_height = (viewport.height * viewport.height / (rows.len() as f64 * 48.0))
+        let thumb_height = (viewport.height * viewport.height / content_height)
             .max(16.0)
             .min(viewport.height);
         let thumb = Rect {
@@ -1693,13 +1658,13 @@ fn draw_scroll_rows(
             height: thumb_height,
         };
         rounded_rectangle(context, thumb, 1.5);
-        set_source(context, palette.accent.with_alpha(0.65));
+        set_source(context, style.accent.with_alpha(0.65));
         let _ = context.fill();
     }
     let _ = context.restore();
 }
 
-fn draw_header(context: &Context, state: &OverlayState, rect: Rect, palette: Palette) {
+fn draw_header(context: &Context, state: &OverlayState, rect: Rect, style: &Style) {
     let Rect {
         x,
         y,
@@ -1714,19 +1679,22 @@ fn draw_header(context: &Context, state: &OverlayState, rect: Rect, palette: Pal
     };
     draw_text(
         context,
+        style,
         x,
         y + if compact { 18.0 } else { 24.0 },
-        &elide_to_width(context, &title, width, 22.0, FontWeight::Bold),
+        &elide_to_width(context, style, &title, width, 22.0, FontWeight::Bold),
         22.0,
         FontWeight::Bold,
-        palette.foreground,
+        style.foreground,
     );
     draw_text(
         context,
+        style,
         x,
         y + if compact { 36.0 } else { 44.0 },
         &elide_to_width(
             context,
+            style,
             &state.snapshot.device_name,
             width,
             13.0,
@@ -1734,7 +1702,7 @@ fn draw_header(context: &Context, state: &OverlayState, rect: Rect, palette: Pal
         ),
         13.0,
         FontWeight::Normal,
-        palette.dark_foreground,
+        style.secondary,
     );
 
     let message =
@@ -1743,15 +1711,16 @@ fn draw_header(context: &Context, state: &OverlayState, rect: Rect, palette: Pal
         );
     draw_text(
         context,
+        style,
         x,
         y + if compact { 54.0 } else { 64.0 },
-        &elide_to_width(context, message, width, 13.0, FontWeight::Normal),
+        &elide_to_width(context, style, message, width, 13.0, FontWeight::Normal),
         13.0,
         FontWeight::Normal,
         if state.snapshot.binding_error.is_some() {
-            palette.red
+            style.red
         } else {
-            palette.dark_foreground
+            style.secondary
         },
     );
 }
@@ -1765,43 +1734,42 @@ fn draw_key(
     hovered: bool,
     modifier_active: bool,
     icon_atlas: Option<&IconAtlas>,
-    palette: Palette,
+    style: &Style,
 ) {
-    rounded_rectangle(context, rect, (rect.height * 0.1).clamp(4.0, 8.0));
-    let fill = if hovered {
-        palette.accent.with_alpha(0.3)
+    let control = if hovered {
+        style.controls[1]
+    } else if modifier_active {
+        style.selected
     } else if actions.is_some() {
-        palette.selection
+        ControlStyle {
+            fill: style.selected.fill,
+            ..style.controls[0]
+        }
     } else {
-        palette.lighter_background.with_alpha(0.34)
+        style.controls[0]
     };
-    set_source(context, fill);
-    let _ = context.fill_preserve();
-    context.set_line_width(if hovered || modifier_active { 2.0 } else { 1.0 });
-    set_source(
-        context,
-        if hovered || modifier_active {
-            palette.accent
-        } else if actions.is_some() {
-            palette.muted
-        } else {
-            palette.muted.with_alpha(0.42)
-        },
-    );
-    let _ = context.stroke();
+    draw_surface(context, rect, style.radius, control);
 
     let legend_color = if actions.is_some() || modifier_active {
-        palette.foreground
+        style.foreground
     } else {
-        palette.dark_foreground.with_alpha(0.66)
+        style.secondary
     };
     // Small full-size boards show fitted legends; actions remain available
     // in the details strip and searchable list.
     if rect.height < 24.0 {
         let size = (rect.height * 0.4).clamp(5.0, 8.0);
-        let legend = elide_to_width(context, legend, rect.width - 4.0, size, FontWeight::Bold);
+        let legend = elide_to_width(
+            context,
+            style,
+            legend,
+            rect.width - 4.0,
+            size,
+            FontWeight::Bold,
+        );
         draw_text_centered(
             context,
+            style,
             rect.x + rect.width / 2.0,
             rect.y + (rect.height + size) / 2.0 - 1.0,
             &legend,
@@ -1815,6 +1783,7 @@ fn draw_key(
     let legend_size = (rect.height * 0.16).clamp(8.0, 11.0);
     let legend = elide_to_width(
         context,
+        style,
         legend,
         rect.width - 10.0,
         legend_size,
@@ -1822,6 +1791,7 @@ fn draw_key(
     );
     draw_text(
         context,
+        style,
         rect.x + 5.0,
         rect.y + legend_y,
         &legend,
@@ -1842,7 +1812,7 @@ fn draw_key(
         context.clip();
         let icons = icons_for_actions(actions);
         if let (Some(atlas), Some(icons)) = (icon_atlas, icons) {
-            draw_action_icons(context, atlas, content, &icons, palette.foreground);
+            draw_action_icons(context, atlas, content, &icons, style.foreground);
         } else {
             let summary = actions.join(" · ");
             let font_size = (rect.height * 0.155).clamp(8.0, 11.5);
@@ -1856,12 +1826,20 @@ fn draw_key(
             for (index, line) in lines.iter().enumerate() {
                 draw_text_centered(
                     context,
+                    style,
                     rect.x + rect.width / 2.0,
                     start_y + index as f64 * (font_size + 3.0),
-                    &elide_to_width(context, line, content.width, font_size, FontWeight::Normal),
+                    &elide_to_width(
+                        context,
+                        style,
+                        line,
+                        content.width,
+                        font_size,
+                        FontWeight::Normal,
+                    ),
                     font_size,
                     FontWeight::Normal,
-                    palette.foreground,
+                    style.foreground,
                 );
             }
         }
@@ -1905,11 +1883,9 @@ fn draw_details(
     state: &OverlayState,
     actions: &BTreeMap<String, Vec<String>>,
     rect: Rect,
-    palette: Palette,
+    style: &Style,
 ) {
-    rounded_rectangle(context, rect, 9.0);
-    set_source(context, palette.darker_background.with_alpha(0.72));
-    let _ = context.fill();
+    draw_surface(context, rect, style.radius, style.controls[0]);
 
     let second_line = (rect.height - 8.0).min(42.0);
     let first_line = (second_line - 18.0).min(21.0);
@@ -1927,19 +1903,29 @@ fn draw_details(
             let chord = chord_label(state.modifiers, &hit.legend);
             draw_text(
                 context,
+                style,
                 rect.x + 14.0,
                 rect.y + first_line,
-                &elide_to_width(context, &chord, rect.width - 28.0, 12.0, FontWeight::Bold),
+                &elide_to_width(
+                    context,
+                    style,
+                    &chord,
+                    rect.width - 28.0,
+                    12.0,
+                    FontWeight::Bold,
+                ),
                 12.0,
                 FontWeight::Bold,
-                palette.accent,
+                style.accent,
             );
             draw_text(
                 context,
+                style,
                 rect.x + 14.0,
                 rect.y + second_line,
                 &elide_to_width(
                     context,
+                    style,
                     &key_actions.join("  •  "),
                     rect.width - 28.0,
                     14.0,
@@ -1947,16 +1933,18 @@ fn draw_details(
                 ),
                 14.0,
                 FontWeight::Normal,
-                palette.foreground,
+                style.foreground,
             );
         }
         Some((hit, None)) => {
             draw_text(
                 context,
+                style,
                 rect.x + 14.0,
                 rect.y + (rect.height + 13.0) / 2.0,
                 &elide_to_width(
                     context,
+                    style,
                     &format!(
                         "{}  ·  No binding",
                         chord_label(state.modifiers, &hit.legend)
@@ -1967,16 +1955,18 @@ fn draw_details(
                 ),
                 13.0,
                 FontWeight::Normal,
-                palette.dark_foreground,
+                style.secondary,
             );
         }
         None => {
             draw_text(
                 context,
+                style,
                 rect.x + 14.0,
                 rect.y + first_line,
                 &elide_to_width(
                     context,
+                    style,
                     "Hover a key or mouse control for details",
                     rect.width - 28.0,
                     13.0,
@@ -1984,16 +1974,17 @@ fn draw_details(
                 ),
                 13.0,
                 FontWeight::Normal,
-                palette.dark_foreground,
+                style.secondary,
             );
             draw_text(
                 context,
+                style,
                 rect.x + 14.0,
                 rect.y + second_line,
                 "Esc or backdrop to close",
                 12.0,
                 FontWeight::Normal,
-                palette.dark_foreground,
+                style.secondary,
             );
         }
     }
@@ -2119,12 +2110,13 @@ fn set_source(context: &Context, color: Color) {
 
 fn elide_to_width(
     context: &Context,
+    style: &Style,
     text: &str,
     width: f64,
     size: f64,
     weight: FontWeight,
 ) -> String {
-    context.select_font_face("sans", FontSlant::Normal, weight);
+    context.select_font_face(&style.font, FontSlant::Normal, weight);
     context.set_font_size(size);
     let fits = |text: &str| {
         context
@@ -2144,8 +2136,10 @@ fn elide_to_width(
     String::new()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_text(
     context: &Context,
+    style: &Style,
     x: f64,
     baseline_y: f64,
     text: &str,
@@ -2153,15 +2147,17 @@ fn draw_text(
     weight: FontWeight,
     color: Color,
 ) {
-    context.select_font_face("sans", FontSlant::Normal, weight);
+    context.select_font_face(&style.font, FontSlant::Normal, weight);
     context.set_font_size(size);
     set_source(context, color);
     context.move_to(x, baseline_y);
     let _ = context.show_text(text);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_text_centered(
     context: &Context,
+    style: &Style,
     center_x: f64,
     baseline_y: f64,
     text: &str,
@@ -2169,7 +2165,7 @@ fn draw_text_centered(
     weight: FontWeight,
     color: Color,
 ) {
-    context.select_font_face("sans", FontSlant::Normal, weight);
+    context.select_font_face(&style.font, FontSlant::Normal, weight);
     context.set_font_size(size);
     let width = context
         .text_extents(text)
@@ -2177,6 +2173,7 @@ fn draw_text_centered(
         .unwrap_or(0.0);
     draw_text(
         context,
+        style,
         center_x - width / 2.0,
         baseline_y,
         text,
@@ -2605,7 +2602,7 @@ mod tests {
             },
         };
         OverlayState {
-            search_style: SearchStyle::default(),
+            style: Style::default(),
             native_entry: false,
             snapshot: RuntimeSnapshot {
                 bindings,
@@ -2613,7 +2610,6 @@ mod tests {
                 layout,
                 device_name: format!("Example keyboard · {}", layout.label()),
                 monitor_connector: None,
-                palette: Palette::default(),
                 pointing,
             },
             geometry: KeyboardGeometry::new(layout),
@@ -2703,7 +2699,7 @@ mod tests {
                             assert!(layout.unit > 0.0 && layout.unit <= 78.0);
                             assert_contains(
                                 layout.search,
-                                search_entry_rect(layout.search, &SearchStyle::default()),
+                                search_entry_rect(layout.search, &Style::default()),
                             );
                             assert!(layout.search.height > 124.0);
                             for hit in layout.keyboard_hits(&geometry) {
@@ -2937,67 +2933,28 @@ mod tests {
             ("search-all", KeyboardLayout::Tkl, 1280, 720, false, false),
             ("search-query", KeyboardLayout::Tkl, 1280, 720, false, false),
             ("search-empty", KeyboardLayout::Tkl, 1280, 720, false, false),
-            (
-                "search-theme-dark",
-                KeyboardLayout::Tkl,
-                1280,
-                720,
-                false,
-                false,
-            ),
-            (
-                "search-theme-light",
-                KeyboardLayout::Tkl,
-                720,
-                1280,
-                false,
-                false,
-            ),
-            (
-                "search-theme-large",
-                KeyboardLayout::Tkl,
-                1280,
-                720,
-                false,
-                false,
-            ),
+            ("theme-dark", KeyboardLayout::Tkl, 1280, 720, false, true),
+            ("theme-light", KeyboardLayout::Tkl, 720, 1280, false, true),
+            ("theme-large", KeyboardLayout::Tkl, 1280, 720, false, true),
         ] {
             let surface = ImageSurface::create(Format::ARgb32, width, height).unwrap();
             let context = Context::new(&surface).unwrap();
             let mut state = fixture_state(layout, left, touch);
-            if name.starts_with("search-theme-") {
-                let style = &mut state.search_style;
-                style.font = "monospace".into();
-                style.radius = 0.0;
-                style.border_width = 2.0;
-                style.foreground = Color::rgb(169, 177, 214);
-                style.controls[2] = ControlStyle {
-                    fill: style.foreground.with_alpha(0.08),
-                    border: style.foreground.with_alpha(0.25),
-                    width: 1.0,
+            if name.starts_with("theme-") {
+                let colors = if name == "theme-light" {
+                    "background = '#f5f5f0'\nforeground = '#282830'\naccent = '#2d4696'"
+                } else {
+                    "background = '#1a1b26'\nforeground = '#a9b1d6'\naccent = '#7aa2f7'"
                 };
-                if name == "search-theme-light" {
-                    style.background = Color::rgb(245, 245, 240);
-                    style.foreground = Color::rgb(40, 40, 48);
-                    style.secondary = Color::rgb(85, 85, 90);
-                    style.accent = Color::rgb(45, 70, 150);
-                    style.border = style.accent;
-                    style.radius = 8.0;
-                    style.controls[2] = ControlStyle {
-                        fill: style.foreground.with_alpha(0.08),
-                        border: style.foreground.with_alpha(0.25),
-                        width: 1.0,
-                    };
-                    style.row_hover.fill = style.foreground.with_alpha(0.08);
-                    style.row_hover_text = style.accent;
-                }
-                if name == "search-theme-large" {
-                    style.body = 20.0;
-                    style.caption = 16.0;
-                    style.heading = 26.0;
-                    style.padding_y = 12.0;
-                    state.snapshot.bindings[0].action = "An unusually long action description that must fit using actual font metrics".into();
-                }
+                let shell = if name == "theme-large" {
+                    "[font]\nbase-size = 20\n[menu]\nborder-width = 2"
+                } else {
+                    "[menu]\nborder-width = 2"
+                };
+                state.style = Style::from_theme(colors, shell);
+                state.snapshot.bindings[0].action =
+                    "An unusually long action description that must fit using actual font metrics"
+                        .into();
             }
             if name == "long-labels" {
                 state.snapshot.device_name =
@@ -3029,7 +2986,7 @@ mod tests {
                 });
             }
             draw_overlay(&context, width as f64, height as f64, &mut state);
-            if name.starts_with("search-theme-") {
+            if name.starts_with("theme-") {
                 let viewport = state.metrics.search.rect;
                 state.metrics.pointer = Some((viewport.x + 10.0, viewport.y + 10.0));
                 state.metrics.search.offset = state.metrics.search.maximum / 2.0;
@@ -3037,7 +2994,7 @@ mod tests {
                 let layout = overlay_layout(width as f64, height as f64, &state);
                 assert_contains(
                     layout.search,
-                    search_entry_rect(layout.search, &state.search_style),
+                    search_entry_rect(layout.search, &state.style),
                 );
                 assert_contains(layout.search, state.metrics.search.rect);
             }
@@ -3100,14 +3057,14 @@ mod tests {
         probe.add_css_class("shortcut-search");
         probe_window.set_child(Some(&probe));
         let baseline_color = probe.style_context().color();
-        let search_style = SearchStyle::load(&gtk::Entry::new());
+        let style = Style::load(&gtk::Entry::new());
         let css_errors = Rc::new(RefCell::new(Vec::new()));
         let provider = gtk::CssProvider::new();
         provider.connect_parsing_error({
             let errors = css_errors.clone();
             move |_, _, error| errors.borrow_mut().push(error.to_string())
         });
-        provider.load_from_data(&search_style.css());
+        provider.load_from_data(&style.css());
         assert!(css_errors.borrow().is_empty(), "{:?}", css_errors.borrow());
         let window = build_window(&application, state.snapshot.clone());
         gtk::prelude::WidgetExt::realize(&window);
@@ -3125,7 +3082,7 @@ mod tests {
             overlay.allocate(width, height, -1, None);
             let expected = search_entry_rect(
                 overlay_layout(width as f64, height as f64, &state).search,
-                &search_style,
+                &style,
             );
             let bounds = entry.compute_bounds(&overlay).unwrap();
             for (actual, expected) in [
@@ -3186,7 +3143,7 @@ mod tests {
                 )
                 .unwrap();
                 let context = Context::new(&surface).unwrap();
-                set_source(&context, search_style.background);
+                set_source(&context, style.background);
                 context.paint().unwrap();
                 context.translate(-bounds.x() as f64, -bounds.y() as f64);
                 node.draw(&context);
@@ -3207,7 +3164,7 @@ mod tests {
         // Reopening re-resolves style and reinstalls exactly one window's CSS.
         let reopened = build_window(&application, state.snapshot.clone());
         gtk::prelude::WidgetExt::realize(&reopened);
-        let resolved = SearchStyle::load(&gtk::Entry::new());
+        let resolved = Style::load(&gtk::Entry::new());
         let actual = probe.style_context().color();
         assert!((actual.red() as f64 - resolved.foreground.red).abs() < 0.005);
         reopened.close();
@@ -3233,7 +3190,7 @@ mod tests {
         );
         let mut state = fixture_state(snapshot.layout, false, false);
         state.snapshot = snapshot;
-        state.search_style = SearchStyle::load_without_gtk();
+        state.style = Style::load_without_gtk();
         let surface = ImageSurface::create(Format::ARgb32, 1920, 1080).unwrap();
         let context = Context::new(&surface).unwrap();
         draw_overlay(&context, 1920.0, 1080.0, &mut state);

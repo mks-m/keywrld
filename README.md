@@ -63,21 +63,31 @@ independently of the touchpad panel, and hover a row for its full chord and
 description. Results provide shortcut help; clicking them does not run actions.
 In landscape layouts, search stays outermost left when the mouse diagram is also on the left.
 
-### Search appearance
+## Appearance
 
-Search styling refreshes whenever the overlay opens. It reads Omarchy's current
-`colors.toml` and `shell.toml` under `$XDG_STATE_HOME/omarchy/current/theme`
-(default `~/.local/state/omarchy/current/theme`). Menu and control colors, font
-sizes, and input spacing take priority; canonical `foreground` wins over
-`bright_foreground`. Omarchy's `monospace` fontconfig alias supplies the font.
+The whole overlay shares one style, refreshed each time it opens. Omarchy's
+`omarchy theme color --all` resolves the current palette, including legacy color
+aliases and derived shades. The theme comes from
+`$XDG_STATE_HOME/omarchy/current/theme` (default
+`~/.local/state/omarchy/current/theme`).
 
-Live Hyprland rounding and border width fill the geometry settings; its active
-border color fills a missing theme border. Remaining colors and fonts come from
-GTK's active desktop theme, then built-in defaults. Border gradients use their
-first color. The reader supports the scalar theme values used by search,
-including color references and alpha values; unsupported or malformed values
-fall back without preventing the overlay from opening. It does not modify any
-system settings. Keyboard, mouse, and touchpad styling is unchanged.
+The theme's `shell.toml` supplies menu surfaces, backdrop opacity, control
+states, text sizes, and list spacing. User overrides in
+`$XDG_CONFIG_HOME/omarchy/shell.toml` (default `~/.config/omarchy/shell.toml`)
+take priority, including the text size set by Omarchy. All panels use Omarchy's
+`monospace` fontconfig alias. Keyboard legends and mouse-diagram text keep
+sizes fitted to their geometry.
+
+Live Hyprland rounding and border width supply panel geometry; its active
+border color fills a missing theme border. Search, keyboard, mouse, and touchpad
+share the same surface and control drawing helpers. Canonical `foreground`
+takes priority over `bright_foreground`.
+
+If the Omarchy resolver is unavailable, the app reads scalar palette values
+directly. Missing or malformed values fall back to GTK's active desktop theme,
+then built-in defaults. Shell color references, alpha values, and scalar border
+widths are supported; gradients use their first color. Unsupported values fall
+back without preventing the overlay from opening. No system settings are changed.
 
 ## Responsive layout
 

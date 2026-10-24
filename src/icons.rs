@@ -1,6 +1,6 @@
 use gtk4::cairo::{Context, ImageSurface};
 
-use crate::core::Color;
+use crate::style::Color;
 
 const TILE_SIZE: i32 = 64;
 const ATLAS_COLUMNS: i32 = 8;
