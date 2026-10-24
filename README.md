@@ -172,12 +172,13 @@ KEYWRLD_RENDER_DIR=/tmp/keywrld-panels cargo test render_panel_fixtures
 
 ## Recording a demo
 
-`scripts/record-demo.py` records a silent 1080p MP4 on a new, empty workspace
-on the focused landscape monitor. It types fuzzy searches (`trm`, `brws`,
-then `brws shift`), holds multiple modifiers, clicks Ctrl and Alt to latch them,
-hovers keys and mouse controls for details, and scrolls the search results.
-Typing, pointer movement, and pauses are paced automatically. The examples
-use Omarchy's default Terminal and Browser bindings.
+`scripts/record-demo.py` records a silent 1080p MP4 on workspace 1, which must
+be on a landscape monitor. It types fuzzy searches (`brws`, then `brws shift`),
+holds Super to hover Enter and mouse controls, then holds CMD+SHIFT
+(Super+Shift) while hovering D → F → G → B. It releases modifiers, scrolls the
+shortcut list, and demonstrates Down/Up navigation. At the end, it types `trm`
+and presses Enter to invoke Terminal. Typing, pointer movement, and short pauses
+are paced automatically. The examples use Omarchy's default bindings.
 
 Requires Python 3, `hyprctl`, `wtype`, `wlrctl`, `gpu-screen-recorder`, and
 `notify-send` for calibration. `wlrctl` supplies mouse input to the layer-shell
@@ -190,15 +191,17 @@ scripts/record-demo.py --calibrate
 scripts/record-demo.py
 ```
 
-Calibration opens the TKL overlay and asks you to point at each control without
-clicking, allowing seven seconds per position. It saves positions to
-`target/demo-points.json`; rerun calibration after changing display scaling,
+Calibration opens the TKL overlay on workspace 1 and asks you to point at each
+control without clicking, allowing seven seconds per position. Positions are saved
+to `target/demo-points.json`; rerun calibration after changing display scaling,
 theme spacing, pointing devices, or panel arrangement. The recording also uses
-the TKL layout. Use `--points PATH` for a different calibration file.
+the TKL layout. Older calibration files need to be regenerated if they lack
+D/F/G positions. Use `--points PATH` for a different calibration file.
 
 The recording run gives a five-second countdown, then runs without interaction.
 Leave the keyboard and mouse untouched until it returns to the original
-workspace. It closes its overlay and finalizes its recorder on interruption,
-too. Output defaults to `target/keywrld-demo-TIMESTAMP.mp4`, with recorder
-diagnostics in a matching `.log` file. Use `--output PATH.mp4` to choose a new
+workspace and monitor. The Terminal launched by the final step remains open on
+workspace 1. The script closes its overlay and finalizes its recorder on
+interruption, too. Output defaults to `target/keywrld-demo-TIMESTAMP.mp4`, with
+recorder diagnostics in a matching `.log` file. Use `--output PATH.mp4` to choose a new
 file, or `--pace 1.3` for slower typing and longer pauses.

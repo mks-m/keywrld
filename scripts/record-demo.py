@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record keywrld on an empty Hyprland workspace with naturally paced inputs."""
+"""Record keywrld on Hyprland workspace 1 with naturally paced inputs."""
 
 import argparse
 from contextlib import contextmanager
@@ -17,25 +17,23 @@ ROOT = Path(__file__).resolve().parents[1]
 POINTS = {
     "clear": "the clear (×) icon in the search field",
     "result": "the first search result row",
-    "shift": "the left Shift key",
-    "ctrl": "the left Ctrl key",
-    "alt": "the left Alt key",
     "enter": "the main Enter key",
+    "d": "the D key",
+    "f": "the F key",
+    "g": "the G key",
     "b": "the B key",
     "mouse_left": "the left button in the mouse diagram",
     "mouse_scroll": "the down arrow on the mouse diagram's scroll wheel",
 }
-MODIFIER_KEYS = {"logo": "Super_L", "shift": "Shift_L", "ctrl": "Control_L", "alt": "Alt_L"}
+MODIFIER_KEYS = {"logo": "Super_L", "shift": "Shift_L"}
 SCENES = (
-    "Overview of all shortcuts",
-    "Fuzzy search: trm → Terminal; hover the result",
+    "Overview of all shortcuts on workspace 1",
     "Fuzzy search: brws; add shift to narrow by modifier",
     "Hold Super; hover Enter and mouse controls",
-    "Hold Super + Shift; hover B",
-    "Hold Super + Shift + Alt; hover B",
-    "Click Ctrl, then Alt to latch multiple modifiers; hover a result",
-    "Clear latched modifiers; scroll the full shortcut list",
-    "Close with Escape",
+    "Hold CMD + SHIFT (Super + Shift); hover D → F → G → B",
+    "Release modifiers; scroll the full shortcut list",
+    "Navigate full list: Down → Down → Up",
+    "Type trm; press Enter to invoke Terminal",
 )
 
 
@@ -69,6 +67,7 @@ class Demo:
     def __init__(self, args, monitor):
         self.args = args
         self.monitor = monitor
+        self.original_monitor = monitor["name"]
         self.app = None
         self.recorder = None
         self.keyboard = None
@@ -81,17 +80,21 @@ class Demo:
         time.sleep(seconds * self.args.pace)
 
     def open(self):
-        used = {workspace["id"] for workspace in hypr_json("workspaces")}
-        workspace = max({0, *[number for number in used if number > 0]}) + 1
-        dispatch(f"hl.dsp.focus({{workspace={workspace}}})")
+        dispatch("hl.dsp.focus({workspace=1})")
         self.switched = True
+        self.monitor = next(m for m in hypr_json("monitors") if m["focused"])
+        width, height = logical_size(self.monitor)
+        if width <= height:
+            raise ValueError("Workspace 1 must be on a landscape monitor")
+        if not self.args.calibrate:
+            self.load_points()
         self.app = subprocess.Popen([str(self.args.binary), "--layout", "tkl"], cwd=ROOT)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if self.app.poll() is not None:
                 raise RuntimeError("keywrld exited before its overlay appeared")
             if self.overlay_open():
-                self.pause(0.7)
+                self.pause(0.4)
                 return
             time.sleep(0.1)
         raise RuntimeError("Timed out waiting for the keywrld overlay")
@@ -122,6 +125,9 @@ class Demo:
         if profile["monitor"] != self.monitor["name"] or profile["geometry"] != geometry(self.monitor):
             raise ValueError("Monitor or scaling changed; run --calibrate again")
         width, height = logical_size(self.monitor)
+        missing = POINTS.keys() - profile["points"].keys()
+        if missing:
+            raise ValueError(f"Missing calibration points ({', '.join(sorted(missing))}); run --calibrate again")
         for name in POINTS:
             x, y = profile["points"][name]
             if not (math.isfinite(x) and math.isfinite(y) and 0 <= x < width and 0 <= y < height):
@@ -148,15 +154,15 @@ class Demo:
     def click(self, name):
         self.move(name)
         run("wlrctl", "pointer", "click", "left")
-        self.pause(0.5)
+        self.pause(0.3)
 
-    def hover(self, name, seconds=2):
+    def hover(self, name, seconds=1.2):
         self.move(name)
         self.pause(seconds)
 
     def type(self, text):
-        run("wtype", "-d", round(160 * self.args.pace), "--", text)
-        self.pause(1.5)
+        run("wtype", "-d", round(100 * self.args.pace), "--", text)
+        self.pause(0.5)
 
     @contextmanager
     def held(self, modifiers, seconds):
@@ -169,17 +175,17 @@ class Demo:
             args.extend(["-p", MODIFIER_KEYS[modifier], "-m", modifier])
         self.keyboard = subprocess.Popen(args)
         try:
-            self.pause(0.35)
+            self.pause(0.2)
             yield
         finally:
             self.keyboard.wait()
             self.keyboard = None
-            self.pause(0.6)
+            self.pause(0.3)
 
     def record(self):
         output = self.args.output
         output.parent.mkdir(parents=True, exist_ok=True)
-        # Keep diagnostics beside the recording if capture/encoding fails.
+        # Keep diagnostics beside the recording if capture fails.
         with output.with_suffix(".log").open("w") as log:
             self.recorder = subprocess.Popen([
                 "gpu-screen-recorder", "-w", self.monitor["name"], "-s", "1920x1080",
@@ -191,7 +197,7 @@ class Demo:
                 if self.recorder.poll() is not None or time.monotonic() > deadline:
                     raise RuntimeError(f"Recording did not start; see {output.with_suffix('.log')}")
                 time.sleep(0.1)
-            self.pause(1)
+            self.pause(0.5)
             self.sequence()
             self.stop_recorder()
         print(f"Saved recording: {output}", flush=True)
@@ -205,46 +211,38 @@ class Demo:
 
     def sequence(self):
         self.scene(0)
-        self.pause(2)
+        self.pause(1)
         self.scene(1)
-        self.type("trm")
-        self.hover("result", 2.5)
-        self.click("clear")
-        self.scene(2)
         self.type("brws")
         self.type(" shift")
         self.hover("result")
         self.click("clear")
-        self.scene(3)
-        with self.held(["logo"], 11):
+        self.scene(2)
+        with self.held(["logo"], 7):
             self.hover("enter")
             self.hover("mouse_left")
-            self.hover("mouse_scroll", 2.5)
+            self.hover("mouse_scroll")
+        self.scene(3)
+        with self.held(["logo", "shift"], 9):
+            for key in ("d", "f", "g", "b"):
+                self.hover(key)
         self.scene(4)
-        with self.held(["logo", "shift"], 4):
-            self.hover("b", 2.5)
-        self.scene(5)
-        with self.held(["logo", "shift", "alt"], 4):
-            self.hover("b", 2.5)
-        self.scene(6)
-        self.click("ctrl")
-        self.pause(0.8)
-        self.click("alt")
-        self.hover("result", 2.5)
-        self.click("alt")
-        self.click("ctrl")
-        self.scene(7)
         self.move("result")
         for _ in range(6):
             run("wlrctl", "pointer", "scroll", "120", "0")
-            self.pause(0.25)
-        self.pause(1.5)
+            self.pause(0.15)
+        self.pause(0.5)
         for _ in range(6):
             run("wlrctl", "pointer", "scroll", "-120", "0")
-            self.pause(0.25)
-        self.pause(1)
-        self.scene(8)
-        run("wtype", "-k", "Escape")
+            self.pause(0.15)
+        self.pause(0.4)
+        self.scene(5)
+        for key in ("Down", "Down", "Up"):
+            run("wtype", "-k", key)
+            self.pause(0.4)
+        self.scene(6)
+        self.type("trm")
+        run("wtype", "-k", "Return")
         self.pause(1)
 
     def stop_recorder(self):
@@ -278,7 +276,7 @@ class Demo:
                         self.app.wait()
             finally:
                 if self.switched:
-                    dispatch(f"hl.dsp.focus({{monitor={json.dumps(self.monitor['name'])}}})")
+                    dispatch(f"hl.dsp.focus({{monitor={json.dumps(self.original_monitor)}}})")
                     dispatch(f"hl.dsp.focus({{workspace={self.original_workspace}}})")
                     cursor = self.original_cursor
                     dispatch(f"hl.dsp.cursor.move({{x={cursor['x']},y={cursor['y']}}})")
@@ -299,7 +297,8 @@ def main():
         for index, scene in enumerate(SCENES, 1):
             print(f"{index}. {scene}")
         return
-    commands = ("hyprctl", "notify-send") if args.calibrate else ("hyprctl", "wtype", "wlrctl", "gpu-screen-recorder")
+    commands = (("hyprctl", "notify-send") if args.calibrate else
+                ("hyprctl", "wtype", "wlrctl", "gpu-screen-recorder"))
     missing = [command for command in commands if not shutil.which(command)]
     if missing:
         parser.error(f"Missing commands: {', '.join(missing)}")
@@ -311,9 +310,6 @@ def main():
     if not args.calibrate and (args.output.suffix != ".mp4" or args.output.exists()):
         parser.error("--output must be a new .mp4 file")
     monitor = next(m for m in hypr_json("monitors") if m["focused"])
-    width, height = logical_size(monitor)
-    if width <= height:
-        parser.error("Focus a landscape monitor before running the demo")
     if any(layer.get("namespace") == "keywrld" for surface in hypr_json("layers").values()
            for level in surface.get("levels", {}).values() for layer in level):
         parser.error("Close the existing keywrld overlay first")
@@ -322,7 +318,6 @@ def main():
         print("Setup: move the pointer to each requested control without clicking.\n"
               "Each notification gives you 7 seconds; recording starts only on a later run.", flush=True)
     else:
-        demo.load_points()
         print("Recording starts in 5 seconds. Leave the keyboard and mouse untouched.\n"
               "The original workspace is restored when finished.", flush=True)
     time.sleep(5)
