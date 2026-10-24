@@ -19,6 +19,6 @@ pkgbase = keywrld
 	depends = pango
 	optdepends = omarchy: Lua binding supplements and desktop theme integration
 	source = keywrld-0.1.8.tar.gz::https://github.com/mks-m/keywrld/archive/refs/tags/v0.1.8.tar.gz
-	sha256sums = TODO_RELEASE_SHA256
+	sha256sums = 8de67cd0625c4e30007aaa52f5ecbdffda351e8c7faab5990eeb2527ec824462
 
 pkgname = keywrld
