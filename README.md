@@ -35,7 +35,7 @@ cargo build --release
 install -Dm755 target/release/keywrld ~/.local/bin/keywrld
 ```
 
-The current machine uses this user keybinding override:
+Add keybinding override:
 
 ```lua
 hl.unbind("SUPER + K")
