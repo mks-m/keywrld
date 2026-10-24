@@ -15,7 +15,7 @@ the same modifier selection, highlighting its bound buttons and scroll wheel.
 
 Demo, showing fuzzy search, multiple modifiers, hover details, and scrolling through shortcuts:
 
-https://github.com/user-attachments/assets/60ed4653-dc98-403b-926f-6789111ab857
+https://github.com/user-attachments/assets/3a2ec4fb-25b7-4340-9c81-e2551b27e945
 
 ## Runtime requirements
 
