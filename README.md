@@ -11,6 +11,11 @@ Super are visible too. Shift, Ctrl, and Alt can also be clicked to keep them
 selected; Super is never latched. A mouse diagram beside the keyboard follows
 the same modifier selection, highlighting its bound buttons and scroll wheel.
 
+![keywrld shortcut overlay with keyboard and mouse panels](assets/readme/screenshot.png)
+
+[Watch the demo](assets/readme/demo.mp4): fuzzy search, multiple modifiers,
+hover details, and scrolling through shortcuts.
+
 ## Runtime requirements
 
 - Omarchy 4 / Hyprland on Wayland
@@ -160,3 +165,36 @@ For tests and optional Cairo previews (no touchpad or graphical session needed):
 cargo test
 KEYWRLD_RENDER_DIR=/tmp/keywrld-panels cargo test render_panel_fixtures
 ```
+
+## Recording a demo
+
+`scripts/record-demo.py` records a silent 1080p MP4 on a new, empty workspace
+on the focused landscape monitor. It types fuzzy searches (`trm`, `brws`,
+then `brws shift`), holds multiple modifiers, clicks Ctrl and Alt to latch them,
+hovers keys and mouse controls for details, and scrolls the search results.
+Typing, pointer movement, and pauses are paced automatically. The examples
+use Omarchy's default Terminal and Browser bindings.
+
+Requires Python 3, `hyprctl`, `wtype`, `wlrctl`, `gpu-screen-recorder`, and
+`notify-send` for calibration. `wlrctl` supplies mouse input to the layer-shell
+overlay; compositor shortcut injection does not reliably reach it.
+
+```sh
+cargo build --release
+scripts/record-demo.py --dry-run
+scripts/record-demo.py --calibrate
+scripts/record-demo.py
+```
+
+Calibration opens the TKL overlay and asks you to point at each control without
+clicking, allowing seven seconds per position. It saves positions to
+`target/demo-points.json`; rerun calibration after changing display scaling,
+theme spacing, pointing devices, or panel arrangement. The recording also uses
+the TKL layout. Use `--points PATH` for a different calibration file.
+
+The recording run gives a five-second countdown, then runs without interaction.
+Leave the keyboard and mouse untouched until it returns to the original
+workspace. It closes its overlay and finalizes its recorder on interruption,
+too. Output defaults to `target/keywrld-demo-TIMESTAMP.mp4`, with recorder
+diagnostics in a matching `.log` file. Use `--output PATH.mp4` to choose a new
+file, or `--pace 1.3` for slower typing and longer pauses.
