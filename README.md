@@ -63,6 +63,22 @@ independently of the touchpad panel, and hover a row for its full chord and
 description. Results provide shortcut help; clicking them does not run actions.
 In landscape layouts, search stays outermost left when the mouse diagram is also on the left.
 
+### Search appearance
+
+Search styling refreshes whenever the overlay opens. It reads Omarchy's current
+`colors.toml` and `shell.toml` under `$XDG_STATE_HOME/omarchy/current/theme`
+(default `~/.local/state/omarchy/current/theme`). Menu and control colors, font
+sizes, and input spacing take priority; canonical `foreground` wins over
+`bright_foreground`. Omarchy's `monospace` fontconfig alias supplies the font.
+
+Live Hyprland rounding and border width fill the geometry settings; its active
+border color fills a missing theme border. Remaining colors and fonts come from
+GTK's active desktop theme, then built-in defaults. Border gradients use their
+first color. The reader supports the scalar theme values used by search,
+including color references and alpha values; unsupported or malformed values
+fall back without preventing the overlay from opening. It does not modify any
+system settings. Keyboard, mouse, and touchpad styling is unchanged.
+
 ## Responsive layout
 
 The overlay uses the screen's available size after display scaling. Wide screens

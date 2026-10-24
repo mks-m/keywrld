@@ -14,6 +14,7 @@ use crate::core::{
 };
 use crate::icons::{ActionIcon, IconAtlas, icons_for_actions, with_icon_atlas};
 use crate::peripherals::{PeripheralRow, touchpad_rows};
+use crate::search_style::{ControlStyle, SearchStyle};
 use crate::system::{RuntimeSnapshot, load_runtime};
 
 #[derive(Clone, Debug)]
@@ -62,6 +63,8 @@ impl RenderMetrics {
 }
 
 struct OverlayState {
+    search_style: SearchStyle,
+    native_entry: bool,
     snapshot: RuntimeSnapshot,
     geometry: KeyboardGeometry,
     latched_modifiers: Modifiers,
@@ -146,35 +149,31 @@ fn build_window(
     }
     select_monitor(&window, snapshot.monitor_connector.as_deref());
 
+    let search_style = SearchStyle::load(&window);
     let provider = gtk::CssProvider::new();
-    let css_color = |color: Color| {
-        format!(
-            "rgb({:.0}, {:.0}, {:.0})",
-            color.red * 255.0,
-            color.green * 255.0,
-            color.blue * 255.0
-        )
-    };
-    provider.load_from_data(&format!(
-        "window.keywrld-overlay {{ background: transparent; }}
-         entry.shortcut-search {{ background: {}; color: {}; border: 1px solid {};
-             border-radius: 7px; padding: 5px 9px; min-height: 0; min-width: 0;
-             font-size: 12px; box-shadow: none; }}
-         entry.shortcut-search:focus-within {{ border-color: {}; }}",
-        css_color(snapshot.palette.darker_background),
-        css_color(snapshot.palette.foreground),
-        css_color(snapshot.palette.muted),
-        css_color(snapshot.palette.accent),
-    ));
+    provider.load_from_data(&search_style.css());
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
             &display,
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+        window.connect_close_request({
+            let display = display.clone();
+            let provider = provider.clone();
+            move |_| {
+                gtk::style_context_remove_provider_for_display(&display, &provider);
+                gtk::glib::Propagation::Proceed
+            }
+        });
+        window.connect_destroy(move |_| {
+            gtk::style_context_remove_provider_for_display(&display, &provider);
+        });
     }
 
     let state = Rc::new(RefCell::new(OverlayState {
+        search_style,
+        native_entry: true,
         geometry: KeyboardGeometry::new(snapshot.layout),
         snapshot,
         latched_modifiers: Modifiers::default(),
@@ -212,9 +211,14 @@ fn build_window(
                 .find(|hit| hit.rect.contains(x, y))
                 .map(|hit| hit.key.clone());
             let mut state = state.borrow_mut();
+            let search_hover_changed = state.metrics.search.rect.contains(x, y)
+                || state
+                    .metrics
+                    .pointer
+                    .is_some_and(|(x, y)| state.metrics.search.rect.contains(x, y));
             state.metrics.pointer = Some((x, y));
             drawing_area.set_tooltip_text(tooltip_at_pointer(&state).as_deref());
-            if state.hovered != hovered {
+            if state.hovered != hovered || search_hover_changed {
                 state.hovered = hovered;
                 drawing_area.queue_draw();
             }
@@ -226,10 +230,8 @@ fn build_window(
         move |_| {
             state.borrow_mut().metrics.pointer = None;
             drawing_area.set_tooltip_text(None);
-            if state.borrow().hovered.is_some() {
-                state.borrow_mut().hovered = None;
-                drawing_area.queue_draw();
-            }
+            state.borrow_mut().hovered = None;
+            drawing_area.queue_draw();
         }
     });
     drawing_area.add_controller(motion);
@@ -351,7 +353,7 @@ fn build_window(
         move |overlay, _| {
             let state = state.borrow();
             let layout = overlay_layout(overlay.width() as f64, overlay.height() as f64, &state);
-            let rect = search_entry_rect(layout.search);
+            let rect = search_entry_rect(layout.search, &state.search_style);
             Some(gdk::Rectangle::new(
                 rect.x.round() as i32,
                 rect.y.round() as i32,
@@ -683,12 +685,12 @@ fn overlay_layout(width: f64, height: f64, state: &OverlayState) -> PanelLayout 
     )
 }
 
-fn search_entry_rect(panel: Rect) -> Rect {
+fn search_entry_rect(panel: Rect, style: &SearchStyle) -> Rect {
     Rect {
         x: panel.x + 12.0,
-        y: panel.y + 42.0,
-        width: panel.width - 24.0,
-        height: 36.0,
+        y: panel.y + 18.0 + style.heading * 1.5,
+        width: (panel.width - 24.0).max(1.0),
+        height: style.entry_height(),
     }
 }
 
@@ -752,49 +754,141 @@ fn shortcut_rows(
         .collect()
 }
 
-fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
-    let palette = state.snapshot.palette;
-    rounded_rectangle(context, panel, 16.0);
-    set_source(context, palette.background.with_alpha(0.985));
-    let _ = context.fill_preserve();
-    context.set_line_width(1.0);
-    set_source(context, palette.muted.with_alpha(0.9));
-    let _ = context.stroke();
-    draw_text(
-        context,
-        panel.x + 18.0,
-        panel.y + 29.0,
-        "SHORTCUTS",
-        15.0,
-        FontWeight::Bold,
-        palette.foreground,
-    );
+// Search uses its own font and measured widths; other panels retain their typography.
+fn search_text(
+    context: &Context,
+    style: &SearchStyle,
+    rect: Rect,
+    text: &str,
+    size: f64,
+    weight: FontWeight,
+    color: Color,
+) {
+    context.select_font_face(&style.font, FontSlant::Normal, weight);
+    context.set_font_size(size);
+    let fits = |text: &str| {
+        context
+            .text_extents(text)
+            .is_ok_and(|e| e.x_advance() <= rect.width)
+    };
+    let mut text = text.to_string();
+    if !fits(&text) {
+        while text.pop().is_some() {
+            if fits(&format!("{text}…")) {
+                text.push('…');
+                break;
+            }
+        }
+    }
+    let _ = context.save();
+    context.rectangle(rect.x, rect.y, rect.width.max(0.0), rect.height.max(0.0));
+    context.clip();
+    let baseline = context
+        .font_extents()
+        .map(|e| (rect.height - e.height()) / 2.0 + e.ascent())
+        .unwrap_or(size);
+    set_source(context, color);
+    context.move_to(rect.x, rect.y + baseline);
+    let _ = context.show_text(&text);
+    let _ = context.restore();
+}
 
-    // The native entry covers this fallback in the live window. Keeping the
-    // field in Cairo also makes standalone panel previews representative.
-    let entry = search_entry_rect(panel);
-    rounded_rectangle(context, entry, 7.0);
-    set_source(context, palette.darker_background);
-    let _ = context.fill_preserve();
-    set_source(context, palette.accent);
-    let _ = context.stroke();
-    draw_text(
+fn search_surface(context: &Context, rect: Rect, radius: f64, control: ControlStyle) {
+    rounded_rectangle(
         context,
-        entry.x + 10.0,
-        entry.y + 23.0,
-        &elide(
+        rect,
+        radius.min(rect.height / 2.0).min(rect.width / 2.0).max(0.0),
+    );
+    set_source(context, control.fill);
+    let _ = context.fill();
+    if control.width > 0.0 {
+        let inset = control.width / 2.0;
+        rounded_rectangle(
+            context,
+            Rect {
+                x: rect.x + inset,
+                y: rect.y + inset,
+                width: (rect.width - control.width).max(0.0),
+                height: (rect.height - control.width).max(0.0),
+            },
+            (radius - inset)
+                .max(0.0)
+                .min((rect.height - control.width).max(0.0) / 2.0),
+        );
+        context.set_line_width(control.width);
+        set_source(context, control.border);
+        let _ = context.stroke();
+    }
+}
+
+fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
+    let style = &state.search_style;
+    search_surface(
+        context,
+        panel,
+        style.radius,
+        ControlStyle {
+            fill: style.background,
+            border: style.border,
+            width: style.border_width,
+        },
+    );
+    search_text(
+        context,
+        style,
+        Rect {
+            x: panel.x + 18.0,
+            y: panel.y + 12.0,
+            width: (panel.width - 36.0).max(0.0),
+            height: style.heading * 1.5,
+        },
+        "SHORTCUTS",
+        style.heading,
+        FontWeight::Bold,
+        style.foreground,
+    );
+    let entry = search_entry_rect(panel, style);
+    // Live GTK draws the field. Previews draw the focused field from the same tokens.
+    if !state.native_entry {
+        search_surface(context, entry, style.radius, style.controls[2]);
+        let inset = style.padding_x + style.controls[2].width;
+        search_text(
+            context,
+            style,
+            Rect {
+                x: entry.x + inset,
+                y: entry.y,
+                width: (entry.width - inset * 2.0 - style.body * 2.0).max(0.0),
+                height: entry.height,
+            },
             if state.query.is_empty() {
                 "Search shortcuts…"
             } else {
                 &state.query
             },
-            ((entry.width - 24.0) / 7.0) as usize,
-        ),
-        12.0,
-        FontWeight::Normal,
-        palette.foreground,
-    );
-
+            style.body,
+            FontWeight::Normal,
+            if state.query.is_empty() {
+                style.secondary
+            } else {
+                style.foreground
+            },
+        );
+        search_text(
+            context,
+            style,
+            Rect {
+                x: entry.x + entry.width - inset - style.body,
+                y: entry.y,
+                width: style.body,
+                height: entry.height,
+            },
+            "×",
+            style.body,
+            FontWeight::Normal,
+            style.secondary,
+        );
+    }
     let rows = shortcut_rows(&state.snapshot.bindings, state.modifiers, &state.query);
     let filter = if state.modifiers.is_empty() {
         "All modifiers".into()
@@ -802,42 +896,135 @@ fn draw_search_panel(context: &Context, panel: Rect, state: &mut OverlayState) {
         state.modifiers.label()
     };
     let noun = if rows.len() == 1 { "result" } else { "results" };
-    let subtitle = format!("{} {noun} · {filter}", rows.len());
-    draw_text(
+    let subtitle_y = entry.y + entry.height + 8.0;
+    search_text(
         context,
-        panel.x + 18.0,
-        panel.y + 99.0,
-        &elide(&subtitle, ((panel.width - 36.0) / 6.0) as usize),
-        11.0,
+        style,
+        Rect {
+            x: panel.x + 18.0,
+            y: subtitle_y,
+            width: (panel.width - 36.0).max(0.0),
+            height: style.caption * 1.5,
+        },
+        &format!("{} {noun} · {filter}", rows.len()),
+        style.caption,
         FontWeight::Normal,
-        palette.dark_foreground,
+        style.secondary,
     );
+    let viewport_y = subtitle_y + style.caption * 1.5 + 10.0;
     let viewport = Rect {
         x: panel.x + 12.0,
-        y: panel.y + 112.0,
-        width: panel.width - 24.0,
-        height: (panel.height - 124.0).max(0.0),
+        y: viewport_y,
+        width: (panel.width - 24.0).max(0.0),
+        height: (panel.y + panel.height - 12.0 - viewport_y).max(0.0),
     };
+    let scroll = &mut state.metrics.search;
+    scroll.rect = viewport;
+    let stride = style.row_height() + style.row_gap;
+    let content_height = (rows.len() as f64 * stride - style.row_gap).max(0.0);
+    scroll.maximum = (content_height - viewport.height).max(0.0);
+    scroll.offset = scroll.offset.clamp(0.0, scroll.maximum);
+    let _ = context.save();
+    context.rectangle(viewport.x, viewport.y, viewport.width, viewport.height);
+    context.clip();
     if rows.is_empty() {
-        draw_text(
+        search_text(
             context,
-            viewport.x + 10.0,
-            viewport.y + 24.0,
+            style,
+            Rect {
+                x: viewport.x + style.padding_x,
+                y: viewport.y,
+                width: (viewport.width - style.padding_x * 2.0).max(0.0),
+                height: style.row_height(),
+            },
             "No matching shortcuts",
-            12.0,
+            style.body,
             FontWeight::Normal,
-            palette.dark_foreground,
+            style.secondary,
         );
     }
-    state.metrics.search.rect = viewport;
-    draw_scroll_rows(
-        context,
-        viewport,
-        &rows,
-        &mut state.metrics.search,
-        &mut state.metrics.rows,
-        palette,
-    );
+    for (index, row) in rows.iter().enumerate() {
+        let rect = Rect {
+            x: viewport.x,
+            y: viewport.y + index as f64 * stride - scroll.offset,
+            width: (viewport.width - 8.0).max(0.0),
+            height: style.row_height(),
+        };
+        if rect.y + rect.height <= viewport.y || rect.y >= viewport.y + viewport.height {
+            continue;
+        }
+        let hovered = state
+            .metrics
+            .pointer
+            .is_some_and(|(x, y)| viewport.contains(x, y) && rect.contains(x, y));
+        if hovered {
+            search_surface(context, rect, style.radius, style.row_hover);
+        }
+        let text_rect = Rect {
+            x: rect.x + style.row_padding_x,
+            y: rect.y + style.padding_y,
+            width: (rect.width - style.row_padding_x * 2.0).max(0.0),
+            height: style.caption * 1.5,
+        };
+        search_text(
+            context,
+            style,
+            text_rect,
+            &row.label,
+            style.caption,
+            FontWeight::Bold,
+            style.accent,
+        );
+        search_text(
+            context,
+            style,
+            Rect {
+                y: text_rect.y + text_rect.height,
+                height: style.body * 1.5,
+                ..text_rect
+            },
+            &row.action,
+            style.body,
+            FontWeight::Normal,
+            if hovered {
+                style.row_hover_text
+            } else {
+                style.foreground
+            },
+        );
+        let top = rect.y.max(viewport.y);
+        let bottom = (rect.y + rect.height).min(viewport.y + viewport.height);
+        state.metrics.rows.push((
+            Rect {
+                y: top,
+                height: bottom - top,
+                ..rect
+            },
+            format!("{}\n{}", row.label, row.action),
+        ));
+    }
+    if scroll.maximum > 0.0 && viewport.height > 0.0 {
+        let height = (viewport.height * viewport.height / content_height)
+            .max(16.0)
+            .min(viewport.height);
+        let thumb = Rect {
+            x: viewport.x + viewport.width - 4.0,
+            y: viewport.y + (viewport.height - height) * scroll.offset / scroll.maximum,
+            width: 3.0,
+            height,
+        };
+        search_surface(
+            context,
+            thumb,
+            style.radius.min(1.5),
+            ControlStyle {
+                fill: style.accent.with_alpha(0.65),
+                border: style.accent,
+                width: 0.0,
+            },
+        );
+    }
+    let _ = context.restore();
 }
 
 // GTK allocations are logical pixels; orientation follows the actual surface,
@@ -2418,6 +2605,8 @@ mod tests {
             },
         };
         OverlayState {
+            search_style: SearchStyle::default(),
+            native_entry: false,
             snapshot: RuntimeSnapshot {
                 bindings,
                 binding_error: None,
@@ -2512,7 +2701,10 @@ mod tests {
                                 }
                             }
                             assert!(layout.unit > 0.0 && layout.unit <= 78.0);
-                            assert_contains(layout.search, search_entry_rect(layout.search));
+                            assert_contains(
+                                layout.search,
+                                search_entry_rect(layout.search, &SearchStyle::default()),
+                            );
                             assert!(layout.search.height > 124.0);
                             for hit in layout.keyboard_hits(&geometry) {
                                 assert_contains(layout.keyboard, hit.rect);
@@ -2745,10 +2937,68 @@ mod tests {
             ("search-all", KeyboardLayout::Tkl, 1280, 720, false, false),
             ("search-query", KeyboardLayout::Tkl, 1280, 720, false, false),
             ("search-empty", KeyboardLayout::Tkl, 1280, 720, false, false),
+            (
+                "search-theme-dark",
+                KeyboardLayout::Tkl,
+                1280,
+                720,
+                false,
+                false,
+            ),
+            (
+                "search-theme-light",
+                KeyboardLayout::Tkl,
+                720,
+                1280,
+                false,
+                false,
+            ),
+            (
+                "search-theme-large",
+                KeyboardLayout::Tkl,
+                1280,
+                720,
+                false,
+                false,
+            ),
         ] {
             let surface = ImageSurface::create(Format::ARgb32, width, height).unwrap();
             let context = Context::new(&surface).unwrap();
             let mut state = fixture_state(layout, left, touch);
+            if name.starts_with("search-theme-") {
+                let style = &mut state.search_style;
+                style.font = "monospace".into();
+                style.radius = 0.0;
+                style.border_width = 2.0;
+                style.foreground = Color::rgb(169, 177, 214);
+                style.controls[2] = ControlStyle {
+                    fill: style.foreground.with_alpha(0.08),
+                    border: style.foreground.with_alpha(0.25),
+                    width: 1.0,
+                };
+                if name == "search-theme-light" {
+                    style.background = Color::rgb(245, 245, 240);
+                    style.foreground = Color::rgb(40, 40, 48);
+                    style.secondary = Color::rgb(85, 85, 90);
+                    style.accent = Color::rgb(45, 70, 150);
+                    style.border = style.accent;
+                    style.radius = 8.0;
+                    style.controls[2] = ControlStyle {
+                        fill: style.foreground.with_alpha(0.08),
+                        border: style.foreground.with_alpha(0.25),
+                        width: 1.0,
+                    };
+                    style.row_hover.fill = style.foreground.with_alpha(0.08);
+                    style.row_hover_text = style.accent;
+                }
+                if name == "search-theme-large" {
+                    style.body = 20.0;
+                    style.caption = 16.0;
+                    style.heading = 26.0;
+                    style.padding_y = 12.0;
+                    state.snapshot.bindings[0].action = "An unusually long action description that must fit using actual font metrics".into();
+                }
+            }
             if name == "long-labels" {
                 state.snapshot.device_name =
                     "A keyboard with an unusually long manufacturer and model name".repeat(3);
@@ -2779,6 +3029,18 @@ mod tests {
                 });
             }
             draw_overlay(&context, width as f64, height as f64, &mut state);
+            if name.starts_with("search-theme-") {
+                let viewport = state.metrics.search.rect;
+                state.metrics.pointer = Some((viewport.x + 10.0, viewport.y + 10.0));
+                state.metrics.search.offset = state.metrics.search.maximum / 2.0;
+                draw_overlay(&context, width as f64, height as f64, &mut state);
+                let layout = overlay_layout(width as f64, height as f64, &state);
+                assert_contains(
+                    layout.search,
+                    search_entry_rect(layout.search, &state.search_style),
+                );
+                assert_contains(layout.search, state.metrics.search.rect);
+            }
             assert_eq!(
                 state.metrics.panels.len(),
                 if touch {
@@ -2832,7 +3094,23 @@ mod tests {
             .register(None::<&gtk::gio::Cancellable>)
             .unwrap();
         let state = fixture_state(KeyboardLayout::Full, false, true);
+        let probe_window = gtk::Window::new();
+        probe_window.add_css_class("keywrld-overlay");
+        let probe = gtk::Entry::new();
+        probe.add_css_class("shortcut-search");
+        probe_window.set_child(Some(&probe));
+        let baseline_color = probe.style_context().color();
+        let search_style = SearchStyle::load(&gtk::Entry::new());
+        let css_errors = Rc::new(RefCell::new(Vec::new()));
+        let provider = gtk::CssProvider::new();
+        provider.connect_parsing_error({
+            let errors = css_errors.clone();
+            move |_, _, error| errors.borrow_mut().push(error.to_string())
+        });
+        provider.load_from_data(&search_style.css());
+        assert!(css_errors.borrow().is_empty(), "{:?}", css_errors.borrow());
         let window = build_window(&application, state.snapshot.clone());
+        gtk::prelude::WidgetExt::realize(&window);
         let overlay = window.child().unwrap().downcast::<gtk::Overlay>().unwrap();
         let entry = overlay
             .last_child()
@@ -2845,8 +3123,10 @@ mod tests {
         }
         for (width, height) in [(1280, 720), (720, 1280), (1920, 1080), (1080, 1920)] {
             overlay.allocate(width, height, -1, None);
-            let expected =
-                search_entry_rect(overlay_layout(width as f64, height as f64, &state).search);
+            let expected = search_entry_rect(
+                overlay_layout(width as f64, height as f64, &state).search,
+                &search_style,
+            );
             let bounds = entry.compute_bounds(&overlay).unwrap();
             for (actual, expected) in [
                 (bounds.x() as f64, expected.x),
@@ -2861,7 +3141,78 @@ mod tests {
             }
             assert_eq!(entry.text().as_str(), "preserved query");
         }
+        if let Some(directory) = std::env::var_os("KEYWRLD_RENDER_DIR") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            // GTK only snapshots mapped widgets. Preview mode briefly maps the
+            // test overlay without taking keyboard focus, then closes it below.
+            window.set_keyboard_mode(KeyboardMode::None);
+            window.present();
+            let main = gtk::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !entry.is_mapped() && std::time::Instant::now() < deadline {
+                while main.pending() {
+                    main.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            for (name, flags, value) in [
+                ("placeholder", gtk::StateFlags::NORMAL, ""),
+                ("hover", gtk::StateFlags::PRELIGHT, "Search shortcuts"),
+                ("focus", gtk::StateFlags::FOCUS_WITHIN, "Search shortcuts"),
+                (
+                    "selection",
+                    gtk::StateFlags::FOCUS_WITHIN,
+                    "Search shortcuts",
+                ),
+            ] {
+                entry.set_text(value);
+                entry.set_state_flags(flags, true);
+                if name == "selection" {
+                    entry.select_region(0, -1);
+                }
+                while main.pending() {
+                    main.iteration(false);
+                }
+                overlay.allocate(1280, 720, -1, None);
+                let snapshot = gtk::Snapshot::new();
+                overlay.snapshot_child(&entry, &snapshot);
+                let node = snapshot.to_node().expect("native entry must render");
+                let bounds = entry.compute_bounds(&overlay).unwrap();
+                let surface = ImageSurface::create(
+                    Format::ARgb32,
+                    bounds.width().ceil() as i32,
+                    bounds.height().ceil() as i32,
+                )
+                .unwrap();
+                let context = Context::new(&surface).unwrap();
+                set_source(&context, search_style.background);
+                context.paint().unwrap();
+                context.translate(-bounds.x() as f64, -bounds.y() as f64);
+                node.draw(&context);
+                surface
+                    .write_to_png(
+                        &mut std::fs::File::create(directory.join(format!("native-{name}.png")))
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
         window.close();
+        assert_eq!(
+            probe.style_context().color(),
+            baseline_color,
+            "closing must remove search CSS"
+        );
+        // Reopening re-resolves style and reinstalls exactly one window's CSS.
+        let reopened = build_window(&application, state.snapshot.clone());
+        gtk::prelude::WidgetExt::realize(&reopened);
+        let resolved = SearchStyle::load(&gtk::Entry::new());
+        let actual = probe.style_context().color();
+        assert!((actual.red() as f64 - resolved.foreground.red).abs() < 0.005);
+        reopened.close();
+        assert_eq!(probe.style_context().color(), baseline_color);
+        probe_window.close();
     }
 
     #[test]
@@ -2882,6 +3233,7 @@ mod tests {
         );
         let mut state = fixture_state(snapshot.layout, false, false);
         state.snapshot = snapshot;
+        state.search_style = SearchStyle::load_without_gtk();
         let surface = ImageSurface::create(Format::ARgb32, 1920, 1080).unwrap();
         let context = Context::new(&surface).unwrap();
         draw_overlay(&context, 1920.0, 1080.0, &mut state);
